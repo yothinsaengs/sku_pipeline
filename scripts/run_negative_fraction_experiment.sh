@@ -3,7 +3,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 if [ -z "$1" ]; then
-    echo "Usage: ./scripts/run_negative_fraction_experiment.sh /path/to/merged_yolo_dataset [extra_args]"
+    echo "Usage: ./scripts/run_negative_fraction_experiment.sh /path/to/raw_dataset_or_zip [--out runs/my_experiment] [extra_args]"
     exit 1
 fi
 

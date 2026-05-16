@@ -9,17 +9,23 @@ from torch.utils.data import Dataset
 
 from sku_clf.geometry import iou_yolo, yolo_to_xyxy
 from sku_clf.utils.io import extract_dataset, find_images, read_class_names, read_yolo_labels, resolve_data_paths
+from sku_clf.validation import assert_dir, assert_file, validate_records
 
 
 def discover_records(data_path: str) -> Dict[str, Any]:
     data_dir = extract_dataset(data_path)
     images_dir, labels_dir = resolve_data_paths(data_dir)
+    assert_dir(images_dir, "Images")
+    assert_dir(labels_dir, "Labels")
     images = find_images(images_dir)
+    if not images:
+        raise ValueError(f"No images found under {images_dir}")
     records = []
     class_ids = set()
     for image_path in images:
         stem = Path(image_path).stem
         label_path = str(Path(labels_dir) / f"{stem}.txt")
+        assert_file(label_path, "YOLO label")
         boxes = read_yolo_labels(label_path)
         if not boxes:
             continue
@@ -30,6 +36,7 @@ def discover_records(data_path: str) -> Dict[str, Any]:
 
     names = read_class_names(data_dir)
     id_to_name = {class_id: names[class_id] if class_id < len(names) else f"class_{class_id}" for class_id in sorted(class_ids)}
+    validate_records(records)
     return {"data_dir": data_dir, "records": records, "id_to_name": id_to_name}
 
 

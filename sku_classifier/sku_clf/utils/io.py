@@ -4,6 +4,8 @@ import zipfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
+from sku_clf.validation import validate_yolo_box
+
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".JPG", ".JPEG", ".PNG")
 
@@ -58,14 +60,19 @@ def read_yolo_labels(label_path: str) -> List[Dict]:
     if not path.exists():
         return []
     boxes = []
-    for line in path.read_text().splitlines():
+    for line_number, line in enumerate(path.read_text().splitlines(), start=1):
         parts = line.strip().split()
         if len(parts) != 5:
-            continue
-        boxes.append({
-            "class_id": int(parts[0]),
-            "bbox": [float(value) for value in parts[1:]],
-        })
+            raise ValueError(f"Invalid YOLO row in {label_path}:{line_number}; expected 5 fields, got {len(parts)}")
+        try:
+            box = {
+                "class_id": int(parts[0]),
+                "bbox": [float(value) for value in parts[1:]],
+            }
+        except ValueError as exc:
+            raise ValueError(f"Invalid numeric value in {label_path}:{line_number}: {line}") from exc
+        validate_yolo_box(box, label_path, f":{line_number}")
+        boxes.append(box)
     return boxes
 
 

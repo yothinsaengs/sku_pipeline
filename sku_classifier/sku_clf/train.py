@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -13,6 +14,7 @@ from tqdm import tqdm
 
 from sku_clf.data.dataset import SKUExperimentDataset
 from sku_clf.data.sampler import BatchRatioSampler
+from sku_clf.logging_utils import append_log
 from sku_clf.models.backbone import get_model
 from sku_clf.models.loss import get_loss_fn
 from sku_clf.utils.metrics import calculate_metrics
@@ -66,6 +68,18 @@ def train_fraction_run(
     scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
     threshold = float(config.get("threshold", 0.5))
     scales = [int(size) for size in config.get("input", {}).get("sizes", [56, 112, 224])]
+    sanity_check_batch(train_ds, config, scales, positive_ids, fraction)
+    write_pretrain_summary(
+        run_dir=run_dir,
+        model=model,
+        config=config,
+        positive_ids=positive_ids,
+        positive_names=positive_names,
+        train_samples=train_samples,
+        val_samples=val_samples,
+        test_samples=test_samples,
+        fraction=fraction,
+    )
     per_class_interval = int(config.get("logging", {}).get("per_class_interval", 5))
     best_val_f1 = -1.0
     epoch_rows = []
@@ -106,6 +120,12 @@ def train_fraction_run(
             pd.DataFrame(per_class_rows).to_csv(run_dir / f"per_class_metrics_epoch_{epoch:03d}.csv", index=False)
 
         mean_val_f1 = float(np.mean([metrics["f1_macro"] for _, metrics in val_scale_rows])) if val_scale_rows else 0.0
+        mean_test_f1 = float(np.mean([metrics["f1_macro"] for _, metrics in test_scale_rows])) if test_scale_rows else 0.0
+        append_log(
+            run_dir.parent,
+            f"fraction={fraction} epoch={epoch} train_loss={train_loss:.6f} "
+            f"mean_val_f1_macro={mean_val_f1:.6f} mean_test_f1_macro={mean_test_f1:.6f}",
+        )
         if mean_val_f1 > best_val_f1:
             best_val_f1 = mean_val_f1
             torch.save({"model_state_dict": model.state_dict(), "config": config, "epoch": epoch}, run_dir / "checkpoints" / "best_model.pth")
@@ -135,6 +155,125 @@ def build_optimizer(model: torch.nn.Module, config: Dict[str, Any]):
     if name == "sgd":
         return optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
     return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+
+def count_by_role(samples: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    return {
+        "total": len(samples),
+        "positive": sum(1 for sample in samples if sample.get("role") == "positive"),
+        "negative": sum(1 for sample in samples if sample.get("role") == "negative"),
+        "negative_box": sum(1 for sample in samples if sample.get("source") == "negative_box"),
+        "background": sum(1 for sample in samples if sample.get("source") == "background"),
+    }
+
+
+def count_images(samples: Sequence[Dict[str, Any]]) -> int:
+    return len({sample.get("stem") for sample in samples})
+
+
+def count_boxes_by_class(samples: Sequence[Dict[str, Any]], positive_ids: Sequence[int], positive_names: Sequence[str]) -> str:
+    id_to_name = {class_id: positive_names[index] for index, class_id in enumerate(positive_ids)}
+    counts = {}
+    for sample in samples:
+        class_id = sample.get("class_id")
+        if sample.get("role") == "positive":
+            counts[class_id] = counts.get(class_id, 0) + 1
+    return "|".join(f"{class_id}:{id_to_name.get(class_id, f'class_{class_id}')}={count}" for class_id, count in sorted(counts.items()))
+
+
+def model_size_summary(model: torch.nn.Module) -> Dict[str, float]:
+    param_count = sum(param.numel() for param in model.parameters())
+    trainable_param_count = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    buffer_count = sum(buffer.numel() for buffer in model.buffers())
+    param_bytes = sum(param.numel() * param.element_size() for param in model.parameters())
+    buffer_bytes = sum(buffer.numel() * buffer.element_size() for buffer in model.buffers())
+    return {
+        "parameter_count": param_count,
+        "trainable_parameter_count": trainable_param_count,
+        "buffer_count": buffer_count,
+        "weight_size_mb": round((param_bytes + buffer_bytes) / (1024 * 1024), 3),
+    }
+
+
+def write_pretrain_summary(
+    run_dir: Path,
+    model: torch.nn.Module,
+    config: Dict[str, Any],
+    positive_ids: Sequence[int],
+    positive_names: Sequence[str],
+    train_samples: Sequence[Dict[str, Any]],
+    val_samples: Sequence[Dict[str, Any]],
+    test_samples: Sequence[Dict[str, Any]],
+    fraction: float,
+) -> None:
+    batch_size = int(config.get("training", {}).get("batch_size", 32))
+    ratio = config.get("sampling", {}).get("pos_neg_ratio", "1:1")
+    sampler = BatchRatioSampler(list(train_samples), batch_size, ratio)
+    model_stats = model_size_summary(model)
+    rows = []
+    for split_name, samples in (("train", train_samples), ("val", val_samples), ("test", test_samples)):
+        role_counts = count_by_role(samples)
+        rows.append({
+            "negative_fraction": fraction,
+            "split": split_name,
+            "image_count": count_images(samples),
+            "sample_count": role_counts["total"],
+            "positive_sample_count": role_counts["positive"],
+            "negative_sample_count": role_counts["negative"],
+            "negative_box_sample_count": role_counts["negative_box"],
+            "background_sample_count": role_counts["background"],
+            "positive_class_count": len(positive_ids),
+            "positive_classes": "|".join(f"{class_id}:{positive_names[index]}" for index, class_id in enumerate(positive_ids)),
+            "positive_box_counts_by_class": count_boxes_by_class(samples, positive_ids, positive_names),
+            "batch_size": batch_size,
+            "train_batch_count": sampler.num_batches if split_name == "train" else math.ceil(len(samples) / batch_size),
+            "train_sampler_pos_per_batch": sampler.num_pos_per_batch if split_name == "train" else "",
+            "train_sampler_neg_per_batch": sampler.num_neg_per_batch if split_name == "train" else "",
+            **model_stats,
+        })
+    df = pd.DataFrame(rows)
+    df.to_csv(run_dir / "pretrain_summary.csv", index=False)
+    lines = [
+        f"Pretrain summary | fraction={fraction}",
+        f"  classes: {len(positive_ids)} positive outputs",
+        f"  train images/samples: {rows[0]['image_count']} images, {rows[0]['sample_count']} samples "
+        f"({rows[0]['positive_sample_count']} pos, {rows[0]['negative_sample_count']} neg)",
+        f"  val images/samples: {rows[1]['image_count']} images, {rows[1]['sample_count']} samples "
+        f"({rows[1]['positive_sample_count']} pos, {rows[1]['negative_sample_count']} neg)",
+        f"  test images/samples: {rows[2]['image_count']} images, {rows[2]['sample_count']} samples "
+        f"({rows[2]['positive_sample_count']} pos, {rows[2]['negative_sample_count']} neg)",
+        f"  batch: size={batch_size}, train_batches={sampler.num_batches}, pos_per_batch={sampler.num_pos_per_batch}, neg_per_batch={sampler.num_neg_per_batch}",
+        f"  model: params={model_stats['parameter_count']}, trainable={model_stats['trainable_parameter_count']}, weight_size_mb={model_stats['weight_size_mb']}",
+    ]
+    text = "\n".join(lines) + "\n"
+    (run_dir / "pretrain_summary.txt").write_text(text)
+    append_log(run_dir.parent, text)
+    append_log(run_dir.parent, f"Pretrain summary saved: {run_dir / 'pretrain_summary.csv'}")
+    print(text, flush=True)
+
+
+def sanity_check_batch(dataset: SKUExperimentDataset, config: Dict[str, Any], scales: Sequence[int], positive_ids: Sequence[int], fraction: float) -> None:
+    if not positive_ids:
+        raise ValueError("No positive model outputs configured")
+    batch_size = int(config.get("training", {}).get("batch_size", 32))
+    sampler = BatchRatioSampler(dataset.samples, batch_size, config.get("sampling", {}).get("pos_neg_ratio", "1:1"))
+    indices = list(iter(sampler))[:batch_size]
+    if not indices:
+        raise ValueError(f"Sampler returned no indices for fraction {fraction}")
+    for scale in scales:
+        dataset.set_fixed_size(scale)
+        batch = [dataset[index] for index in indices]
+        inputs = torch.stack([item[0] for item in batch], dim=0)
+        targets = torch.stack([item[1] for item in batch], dim=0)
+        hard_targets = torch.stack([item[2] for item in batch], dim=0)
+        expected_shape = (len(batch), 3, scale, scale)
+        if tuple(inputs.shape) != expected_shape:
+            raise ValueError(f"Bad input tensor shape for scale {scale}: got {tuple(inputs.shape)}, expected {expected_shape}")
+        expected_target_shape = (len(batch), len(positive_ids))
+        if tuple(targets.shape) != expected_target_shape or tuple(hard_targets.shape) != expected_target_shape:
+            raise ValueError(f"Bad target shape for fraction {fraction}: got {tuple(targets.shape)} and {tuple(hard_targets.shape)}, expected {expected_target_shape}")
+        if not torch.isfinite(inputs).all() or not torch.isfinite(targets).all():
+            raise ValueError(f"Non-finite tensor values found in first-batch sanity check for fraction {fraction}")
 
 
 def train_one_epoch(model, dataset: SKUExperimentDataset, config: Dict[str, Any], criterion, optimizer, device, epoch: int, epochs: int, scales: Sequence[int]) -> float:

@@ -4,6 +4,22 @@ import numpy as np
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
 
 
+def safe_binary_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    unique = np.unique(y_true)
+    if unique.size < 2:
+        return np.nan
+    return float(roc_auc_score(y_true, y_score))
+
+
+def safe_macro_auc(targets: np.ndarray, outputs: np.ndarray) -> float:
+    aucs = []
+    for class_index in range(targets.shape[1]):
+        auc = safe_binary_auc(targets[:, class_index], outputs[:, class_index])
+        if not np.isnan(auc):
+            aucs.append(auc)
+    return float(np.mean(aucs)) if aucs else np.nan
+
+
 def probabilities_to_labels(outputs: np.ndarray, threshold: float) -> np.ndarray:
     if outputs.size == 0:
         return np.array([], dtype=np.int64)
@@ -69,10 +85,7 @@ def calculate_metrics(outputs: np.ndarray, hard_targets: np.ndarray, threshold: 
         "false_negative_rate": fn / positives if positives else 0.0,
     }
 
-    try:
-        metrics["roc_auc_macro"] = roc_auc_score(hard_targets, outputs, average="macro")
-    except ValueError:
-        metrics["roc_auc_macro"] = np.nan
+    metrics["roc_auc_macro"] = safe_macro_auc(hard_targets, outputs)
 
     per_class = []
     p, r, f1, s = precision_recall_fscore_support(true_labels, pred_labels, labels=labels, average=None, zero_division=0)
@@ -86,10 +99,7 @@ def calculate_metrics(outputs: np.ndarray, hard_targets: np.ndarray, threshold: 
             "f1": f1[idx],
         }
         if label < num_classes:
-            try:
-                row["roc_auc"] = roc_auc_score(hard_targets[:, label], outputs[:, label])
-            except ValueError:
-                row["roc_auc"] = np.nan
+            row["roc_auc"] = safe_binary_auc(hard_targets[:, label], outputs[:, label])
         else:
             row["roc_auc"] = np.nan
         per_class.append(row)

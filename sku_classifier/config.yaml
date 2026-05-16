@@ -1,0 +1,222 @@
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+  images_dir: "dataset/images"
+  labels_dir: "dataset/labels"
+  split:
+    train: 0.7
+    val:   0.15
+    test:  0.15
+  split_seed: 42
+
+# ── Class Mapping ─────────────────────────────────────────────────────────────
+classes:
+  - id: 0
+    name: "cola_can"
+    role: positive          # sigmoid target → 1.0 (with label smoothing)
+  - id: 1
+    name: "water_bottle"
+    role: positive
+  - id: 2
+    name: "shelf_label"
+    role: negative          # all sigmoid outputs trained → ~0.0
+  - id: 3
+    name: "hand"
+    role: negative
+# Any class_id NOT listed is ignored (skipped during dataset build)
+
+# ── Label Smoothing ───────────────────────────────────────────────────────────
+label_smoothing: 0.1        # ε applied to positive targets only
+
+# ── Input / Preprocessing ─────────────────────────────────────────────────────
+input:
+  min_size: 4               # pixels — discard boxes smaller than this
+  max_size: 224             # pixels — longest side after padding
+  context_margin: 0.15      # expand bbox by this fraction before crop (e.g. 0.15 = +15%)
+  pad_color: 114            # gray value for letterbox padding (keep aspect ratio)
+
+# ── Sampling / Class Balance ──────────────────────────────────────────────────
+sampling:
+  pos_neg_ratio: "1:2"      # enforced per batch (batch-level ratio sampler)
+  # Experiment: vary negative budget size to find minimum viable negative count
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  backbone: "efficientnetv2_s"    # timm pretrained ImageNet (s / m / l configurable)
+  pretrained: true
+  head:
+    global_pool: "avg"            # AdaptiveAvgPool → fixed vector regardless of input size
+    dropout: 0.3
+  num_classes: 2                  # number of positive classes (one sigmoid output per class)
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  epochs: 50
+  batch_size: 32
+  optimizer: "adamw"
+  lr: 0.0003
+  weight_decay: 0.01
+  scheduler: "cosine"
+  device: "auto"                  # auto-detect: cuda → mps → cpu
+  finetune: "all"                 # fine-tune all backbone layers from start
+
+  early_stopping:
+    enabled: true
+    monitor: "val_f1_macro"
+    patience: 10                  # stop if no improvement for N epochs
+    min_delta: 0.001
+
+  resume:
+    enabled: false
+    checkpoint_path: ""           # path to .pth checkpoint to resume from
+
+  sanity_check:
+    enabled: true
+    num_batches: 2                # run forward pass on N batches before full training
+
+  log_every_n_steps: 50          # print metrics to log file every N steps
+
+  checkpoints:
+    keep_last_n: 3                # keep last N epoch checkpoints + best model
+    save_dir: "checkpoints"       # relative to run folder
+
+  auto_eval_after_train: true     # auto-run test set evaluation after training completes
+
+# ── WandB ─────────────────────────────────────────────────────────────────────
+wandb:
+  enabled: false                  # off by default — enable via --wandb flag at runtime
+  project: "sku_classifier"
+  log:
+    - loss
+    - acc
+    - f1_macro
+    - precision_macro
+    - recall_macro                # logged per epoch for train + val
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  type: "focal"                   # options: "focal" | "bce"
+  focal:
+    alpha: 0.25
+    gamma: 2.0
+
+# ── Decision Threshold ────────────────────────────────────────────────────────
+threshold: 0.5                    # fixed for POC; per-class tuning deferred
+
+# ── Augmentation ──────────────────────────────────────────────────────────────
+augmentation:
+  # Safe — always applied
+  safe:
+    horizontal_flip: true
+    vertical_flip: false
+    color_jitter:
+      brightness: 0.2
+      contrast:   0.2
+      saturation: 0.2
+      hue:        0.05
+    random_rotation_deg: 15
+
+  # Risky — applied randomly with given probability (random mix)
+  random_mix:
+    - name: "aggressive_color_jitter"
+      prob: 0.3
+      params: { brightness: 0.5, contrast: 0.5, saturation: 0.5 }
+    - name: "slight_perspective"
+      prob: 0.2
+      params: { distortion_scale: 0.2 }
+    - name: "gaussian_blur"
+      prob: 0.2
+      params: { kernel_size: 3 }
+
+  # Random Occlusion — simulate partial obstruction of SKU crops
+  random_occlusion:
+    enabled: true
+    prob: 0.3                     # probability of applying per crop
+    max_count: 4                  # random number of occluders: 1 to max_count
+    shapes: ["rect", "ellipse", "polygon"]  # arbitrary shape types
+    scale_range: [0.05, 0.25]     # occluder size as fraction of crop size
+    fill: "random"                # fill color: "random" | "black" | "mean"
+
+  # Class Mixing — neg+pos blending for smoother decision boundary
+  class_mixing:
+    enabled: true
+    strategy: "both"              # "mixup" | "cutmix" | "both"
+    pairs: "neg_pos"              # only mix negative + positive samples
+    prob: 0.3                     # probability of applying mixing per batch
+    mixup:
+      alpha: 0.4                  # Beta distribution α — controls blend strength λ
+    cutmix:
+      alpha: 1.0                  # Beta distribution α for region area ratio
+
+# ── Extra Negative Sources ────────────────────────────────────────────────────
+extra_negatives:
+  enabled: false
+
+  # Synthetic negatives — random crop-paste from own dataset images (CutPaste-style)
+  synthetic_cutpaste:
+    enabled: true
+    count_per_epoch: 500          # how many synthetic negatives to generate per epoch
+    shapes: ["rect", "ellipse", "polygon"]  # patch shapes to sample
+    scale_range: [0.05, 0.3]      # patch size as fraction of source image
+    source: "non_roi_regions"     # crop from background regions (outside all bboxes)
+    paste_background: "random_crop_same_image"  # paste onto random bg crop from same image
+
+  # Real open-source negatives — diverse out-of-domain coverage
+  open_source:
+    - name: "coco_background"
+      path: "data/extra_neg/coco"
+      type: "random_crop"         # crop from non-object regions
+      enabled: false
+    - name: "openimages"
+      path: "data/extra_neg/openimages"
+      type: "random_crop"
+      enabled: false
+    - name: "sku110k_non_target"
+      path: "data/extra_neg/sku110k"
+      type: "random_crop"         # hard negatives — same retail domain
+      enabled: false
+    - name: "dtd_textures"
+      path: "data/extra_neg/dtd"
+      type: "full_image"          # pure texture, no objects
+      enabled: false
+    - name: "places365"
+      path: "data/extra_neg/places365"
+      type: "random_crop"
+      enabled: false
+
+  # Mix ratio per batch: labeled_neg : synthetic : open_source
+  mix_ratio:
+    labeled:    0.5
+    synthetic:  0.3
+    open_source: 0.2
+
+# ── Class Split Experiment ────────────────────────────────────────────────────
+class_split_experiment:
+  enabled: false                  # set true to activate generalization experiment
+
+  # Option A: explicit assignment
+  mode: "explicit"                # "explicit" | "random"
+  explicit:
+    positive: ["cola_can", "water_bottle"]
+    negative: ["shelf_label", "hand"]   # or "ALL_REMAIN"
+    # eval (unseen) = all classes not listed above
+
+  # Option B: random sampling — picks n/4 pos and n/4 neg from all known classes
+  random:
+    seed: 42                      # fixed seed; override per run if needed
+    pos_fraction: 0.25            # fraction of all classes assigned as train positive
+    neg_fraction: 0.25            # fraction of all classes assigned as train negative
+    # eval (unseen) = remaining ~0.5 of classes
+
+  # Key metric: FP rate on unseen eval classes — does negative signal generalize?
+
+# ── Logging & Checkpointing ───────────────────────────────────────────────────
+logging:
+  run_dir: "runs"                 # runs/<timestamp>_<experiment_name>/
+  log_file: "train.log"          # saved inside run folder (console output redirected here)
+  metrics_csv: true
+  plots: true                     # seaborn/matplotlib plots saved per run
+  aug_preview:
+    enabled: true                 # save grid of augmented crops before training starts
+    num_samples: 16               # number of crops to show in grid
+    save_file: "aug_preview.png"  # saved to run folder
+  cross_run_csv: "runs/all_runs.csv"  # append per-run summary metrics for easy comparison

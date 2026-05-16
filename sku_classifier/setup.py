@@ -17,6 +17,7 @@ setup(
         "scikit-learn",
         "tqdm",
         "albumentations",
+        "questionary",
     ],
     entry_points={
         "console_scripts": [

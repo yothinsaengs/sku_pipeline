@@ -22,6 +22,8 @@ def merge_args_with_config(args: argparse.Namespace, config: Dict[str, Any]) -> 
         config['training']['batch_size'] = args.batch_size
     if hasattr(args, 'device') and args.device:
         config['training']['device'] = args.device
+    if hasattr(args, 'pos_neg_ratio') and args.pos_neg_ratio:
+        config.setdefault('sampling', {})['pos_neg_ratio'] = args.pos_neg_ratio
     return config
 
 def main():
@@ -36,6 +38,7 @@ def main():
     train_parser.add_argument("--epochs", type=int, help="Override number of epochs")
     train_parser.add_argument("--batch_size", type=int, help="Override batch size")
     train_parser.add_argument("--device", type=str, help="Override device (cpu, cuda, mps)")
+    train_parser.add_argument("--pos-neg-ratio", "--pos_neg_ratio", dest="pos_neg_ratio", type=str, help="Override positive:negative sampler ratio, e.g. 1:1 or 1:2")
     train_parser.add_argument("--wandb", action="store_true", help="Enable WandB logging")
 
     # Eval command

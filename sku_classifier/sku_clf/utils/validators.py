@@ -22,6 +22,15 @@ def validate_config(config: Dict[str, Any]):
     
     if not pos_found:
         raise ConfigError("no classes with role: positive defined")
+
+    # Sampling
+    ratio = config.get('sampling', {}).get('pos_neg_ratio', '1:1')
+    try:
+        pos_part, neg_part = map(int, ratio.split(':'))
+    except Exception as exc:
+        raise ConfigError(f"sampling.pos_neg_ratio must look like '1:1', got '{ratio}'") from exc
+    if pos_part <= 0 or neg_part <= 0:
+        raise ConfigError(f"sampling.pos_neg_ratio values must be positive, got '{ratio}'")
     
     # Model
     if config['model'].get('num_classes') != len([c for c in config['classes'] if c['role'] == 'positive']):

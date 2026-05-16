@@ -1,4 +1,5 @@
 import torch
+import os
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim import lr_scheduler
@@ -14,6 +15,10 @@ from sku_clf.utils.metrics import calculate_metrics, get_confusion_matrix
 from sku_clf.utils.plots import plot_loss_curve, plot_metrics_curves, plot_confusion_matrix, plot_aug_preview
 
 def train(config: Dict[str, Any], data_path: str):
+    train_loader, val_loader, test_loader = get_dataloaders(config, data_path)
+    return train_with_dataloaders(config, train_loader, val_loader, test_loader)
+
+def train_with_dataloaders(config: Dict[str, Any], train_loader, val_loader, test_loader):
     # Setup Logger
     logger = RunLogger(config)
     logger.log("Starting training session")
@@ -31,9 +36,13 @@ def train(config: Dict[str, Any], data_path: str):
         device = torch.device(device_name)
     logger.log(f"Using device: {device}")
     
-    # Data Loaders
-    train_loader, val_loader, test_loader = get_dataloaders(config, data_path)
     logger.log(f"Data loaded: {len(train_loader.dataset)} train, {len(val_loader.dataset)} val, {len(test_loader.dataset)} test samples")
+    logger.log(f"Batch sampler pos:neg ratio: {config.get('sampling', {}).get('pos_neg_ratio', '1:1')}")
+    if hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'num_pos_per_batch'):
+        logger.log(
+            f"Expected train batch mix: {train_loader.sampler.num_pos_per_batch} positive, "
+            f"{train_loader.sampler.num_neg_per_batch} negative; sampler uses replacement when needed"
+        )
     
     # Model
     model = get_model(config).to(device)
@@ -71,6 +80,17 @@ def train(config: Dict[str, Any], data_path: str):
     val_losses = []
     
     for epoch in range(epochs):
+        # Multiscale logic
+        current_size = config['input'].get('max_size', 224)
+        if config['training'].get('multiscale', False):
+            # Sample a random size from 128 to max_size in steps of 32
+            sizes = list(range(128, config['input'].get('max_size', 224) + 1, 32))
+            current_size = np.random.choice(sizes)
+            train_loader.dataset.set_target_size(current_size)
+            logger.log(f"Epoch {epoch+1} | Multiscale active | Input size: {current_size}x{current_size}")
+        else:
+            logger.log(f"Epoch {epoch+1} | Input size: {current_size}x{current_size}")
+
         model.train()
         running_loss = 0.0
         
@@ -149,7 +169,7 @@ def train(config: Dict[str, Any], data_path: str):
     # Load best model
     best_path = os.path.join(logger.run_dir, 'checkpoints', 'best_model.pth')
     if os.path.exists(best_path):
-        checkpoint = torch.load(best_path)
+        checkpoint = torch.load(best_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
     
     test_loss, test_metrics, outputs_all, targets_all = evaluate_epoch(model, test_loader, criterion, device, config['threshold'], return_all=True)

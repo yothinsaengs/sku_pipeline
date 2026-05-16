@@ -32,46 +32,15 @@ class SKUROIDataset(Dataset):
         self.max_size = config['input'].get('max_size', 224)
         self.context_margin = config['input'].get('context_margin', 0.15)
         self.pad_color = config['input'].get('pad_color', 114)
+        self.target_size = self.max_size
         
         self.samples = self._prepare_samples()
 
+    def set_target_size(self, size: int):
+        self.target_size = size
+
     def _prepare_samples(self) -> List[Dict[str, Any]]:
         samples = []
-        
-        # Experiment Logic
-        exp_config = self.config.get('class_split_experiment', {})
-        enabled = exp_config.get('enabled', False)
-        
-        all_class_ids = [c['id'] for c in self.classes_config]
-        train_pos_ids = []
-        train_neg_ids = []
-        eval_ids = []
-
-        if enabled:
-            mode = exp_config.get('mode', 'explicit')
-            if mode == 'explicit':
-                pos_names = exp_config['explicit'].get('positive', [])
-                neg_names = exp_config['explicit'].get('negative', [])
-                
-                name_to_id = {c['name']: c['id'] for c in self.classes_config}
-                train_pos_ids = [name_to_id[n] for n in pos_names if n in name_to_id]
-                
-                if neg_names == "ALL_REMAIN":
-                    train_neg_ids = [cid for cid in all_class_ids if cid not in train_pos_ids]
-                else:
-                    train_neg_ids = [name_to_id[n] for n in neg_names if n in name_to_id]
-            else: # random
-                import random as r
-                r.seed(exp_config['random'].get('seed', 42))
-                shuffled = all_class_ids.copy()
-                r.shuffle(shuffled)
-                n = len(shuffled)
-                num_pos = int(n * exp_config['random'].get('pos_fraction', 0.25))
-                num_neg = int(n * exp_config['random'].get('neg_fraction', 0.25))
-                train_pos_ids = shuffled[:num_pos]
-                train_neg_ids = shuffled[num_pos:num_pos + num_neg]
-            
-            eval_ids = [cid for cid in all_class_ids if cid not in train_pos_ids and cid not in train_neg_ids]
 
         for img_path, lbl_path in zip(self.image_paths, self.label_paths):
             if not os.path.exists(lbl_path):
@@ -90,19 +59,9 @@ class SKUROIDataset(Dataset):
                 x_center, y_center, width, height = map(float, parts[1:])
                 image_bboxes.append([x_center, y_center, width, height])
 
-                if enabled:
-                    if class_id in train_pos_ids:
-                        role = 'positive'
-                    elif class_id in train_neg_ids:
-                        role = 'negative'
-                    elif not self.is_training and class_id in eval_ids:
-                        role = 'negative'
-                    else:
-                        continue
-                else:
-                    if class_id not in self.id_to_role:
-                        continue
-                    role = self.id_to_role[class_id]
+                if class_id not in self.id_to_role:
+                    continue
+                role = self.id_to_role[class_id]
                 
                 samples.append({
                     'image_path': img_path,
@@ -112,8 +71,9 @@ class SKUROIDataset(Dataset):
                 })
 
             # Add synthetic negatives if enabled
-            if self.is_training and self.config['extra_negatives'].get('enabled'):
-                synthetic_cfg = self.config['extra_negatives'].get('synthetic_cutpaste', {})
+            extra_negatives = self.config.get('extra_negatives', {})
+            if self.is_training and extra_negatives.get('enabled'):
+                synthetic_cfg = extra_negatives.get('synthetic_cutpaste', {})
                 if synthetic_cfg.get('enabled'):
                     samples.append({
                         'image_path': img_path,
@@ -145,13 +105,15 @@ class SKUROIDataset(Dataset):
         role = sample['role']
         
         img = cv2.imread(img_path)
+        if img is None:
+            raise FileNotFoundError(f"Could not read image: {img_path}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         h, w = img.shape[:2]
         
         if role == 'synthetic':
             from sku_clf.data.extra_neg import generate_synthetic_negative
             crop = generate_synthetic_negative(img, sample['image_bboxes'], self.config)
-            crop = self._letterbox(crop, (self.max_size, self.max_size), color=self.pad_color)
+            crop = self._letterbox(crop, (self.target_size, self.target_size), color=self.pad_color)
             class_id = -1
         else:
             bbox = sample['bbox']
@@ -162,9 +124,9 @@ class SKUROIDataset(Dataset):
             x2, y2 = min(w, int(xc + bw_ext / 2)), min(h, int(yc + bh_ext / 2))
             crop = img[y1:y2, x1:x2]
             if crop.shape[0] < self.min_size or crop.shape[1] < self.min_size:
-                crop = np.zeros((self.max_size, self.max_size, 3), dtype=np.uint8)
+                crop = np.zeros((self.target_size, self.target_size, 3), dtype=np.uint8)
             else:
-                crop = self._letterbox(crop, (self.max_size, self.max_size), color=self.pad_color)
+                crop = self._letterbox(crop, (self.target_size, self.target_size), color=self.pad_color)
         
         if self.transform:
             augmented = self.transform(image=crop)
@@ -226,12 +188,13 @@ def get_dataloaders(config: Dict[str, Any], data_path: str):
     test_ds = SKUROIDataset(test_imgs, test_lbls, config, transform=get_transforms(config, False), is_training=False)
     
     batch_size = config['training']['batch_size']
-    ratio = config['sampling'].get('pos_neg_ratio', "1:2")
+    ratio = config['sampling'].get('pos_neg_ratio', "1:1")
     train_sampler = BatchRatioSampler(train_ds.samples, batch_size, ratio)
-    
-    num_workers = config['training'].get('num_workers', 4)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=train_sampler, num_workers=num_workers)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    # Loaders
+    num_workers = config['training'].get('num_workers', 0)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=train_sampler, num_workers=num_workers, pin_memory=False)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
+
     
     return train_loader, val_loader, test_loader

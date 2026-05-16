@@ -15,7 +15,7 @@ class RunLogger:
         
         # experiment_name suffix
         loss_type = config['loss']['type']
-        ratio = config['sampling'].get('pos_neg_ratio', "1to2").replace(':', 'to')
+        ratio = config['sampling'].get('pos_neg_ratio', "1:1").replace(':', 'to')
         self.run_name = f"{self.timestamp}_{loss_type}_{ratio}"
         self.run_dir = os.path.join(self.base_run_dir, self.run_name)
         

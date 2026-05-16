@@ -1,19 +1,21 @@
 import os
 import yaml
 import glob
+import questionary
 from typing import List, Dict, Any, Set
 from sku_clf.utils.io import extract_dataset, resolve_data_paths
 
-def get_unique_classes(labels_dir: str) -> Set[int]:
-    class_ids = set()
+def get_class_stats(labels_dir: str) -> Dict[int, int]:
+    counts = {}
     label_files = glob.glob(os.path.join(labels_dir, "*.txt"))
     for f in label_files:
         with open(f, 'r') as lbl:
             for line in lbl:
                 parts = line.strip().split()
                 if parts:
-                    class_ids.add(int(parts[0]))
-    return class_ids
+                    class_id = int(parts[0])
+                    counts[class_id] = counts.get(class_id, 0) + 1
+    return counts
 
 def find_class_names(data_dir: str, class_ids: Set[int]) -> Dict[int, str]:
     # Try common YOLO name file locations
@@ -41,57 +43,77 @@ def find_class_names(data_dir: str, class_ids: Set[int]) -> Dict[int, str]:
     return names
 
 def interactive_config_gen(data_path: str, output_config: str = "config.yaml"):
-    print(f"--- SKU Classifier Configuration Generator ---")
+    print(f"\n--- SKU Classifier Configuration Generator ---")
     
     # 1. Extract/Resolve
     data_dir = extract_dataset(data_path)
     images_dir, labels_dir = resolve_data_paths(data_dir)
     
     # 2. Scan classes
-    class_ids = get_unique_classes(labels_dir)
-    if not class_ids:
+    stats = get_class_stats(labels_dir)
+    if not stats:
         print("Error: No class IDs found in labels.")
         return
     
+    class_ids = set(stats.keys())
     id_to_name = find_class_names(data_dir, class_ids)
-    
-    print(f"\nFound {len(class_ids)} unique classes in the dataset:")
     sorted_ids = sorted(list(class_ids))
-    for cid in sorted_ids:
-        print(f"  [{cid}] {id_to_name[cid]}")
+    
+    # 3. Positive Selection using Questionary
+    choices = [
+        questionary.Choice(
+            title=f"{cid:3}: {id_to_name[cid]:15} (Count: {stats[cid]})",
+            value=cid
+        ) for cid in sorted_ids
+    ]
+    
+    pos_ids = questionary.checkbox(
+        "Select POSITIVE classes:",
+        choices=choices
+    ).ask()
+    
+    if pos_ids is None or not pos_ids:
+        print("Operation cancelled or no positive classes selected.")
+        return
+
+    # 4. Negative Selection from remaining
+    remaining_ids = [cid for cid in sorted_ids if cid not in pos_ids]
+    if remaining_ids:
+        neg_choices = [
+            questionary.Choice(
+                title=f"{cid:3}: {id_to_name[cid]:15} (Count: {stats[cid]})",
+                value=cid
+            ) for cid in remaining_ids
+        ]
         
-    # 3. User Selection
-    print("\n--- Positive Class Selection ---")
-    print("Enter the IDs of POSITIVE classes (comma separated, e.g. 0,1):")
-    pos_input = input("> ").strip()
-    pos_ids = [int(x.strip()) for x in pos_input.split(',') if x.strip().isdigit()]
-    
-    print("\n--- Negative Class Selection ---")
-    print("Enter the IDs of NEGATIVE classes (comma separated, or type 'all' for all remaining):")
-    neg_input = input("> ").strip().lower()
-    
-    neg_ids = []
-    if neg_input == 'all':
-        neg_ids = [cid for cid in sorted_ids if cid not in pos_ids]
+        # Add "Select All" logic or just use checkbox
+        neg_ids = questionary.checkbox(
+            "Select NEGATIVE classes:",
+            choices=neg_choices
+        ).ask()
+        
+        if neg_ids is None:
+            neg_ids = []
     else:
-        neg_ids = [int(x.strip()) for x in neg_input.split(',') if x.strip().isdigit()]
+        neg_ids = []
         
-    # 4. Construct classes list
+    # 5. Construct classes list
     classes_list = []
-    for cid in pos_ids:
+    for cid in sorted(pos_ids):
         classes_list.append({'id': cid, 'name': id_to_name[cid], 'role': 'positive'})
-    for cid in neg_ids:
+    for cid in sorted(neg_ids):
         classes_list.append({'id': cid, 'name': id_to_name[cid], 'role': 'negative'})
         
-    # 5. Save/Update Config
+    # 6. Save/Update Config
     config = {}
     if os.path.exists(output_config):
         with open(output_config, 'r') as f:
             config = yaml.safe_load(f)
             
-    # Update classes and dataset paths
-    config['classes'] = classes_list
+    if 'model' not in config: config['model'] = {}
     if 'dataset' not in config: config['dataset'] = {}
+    
+    config['classes'] = classes_list
     config['dataset']['images_dir'] = images_dir
     config['dataset']['labels_dir'] = labels_dir
     config['model']['num_classes'] = len(pos_ids)
@@ -99,4 +121,6 @@ def interactive_config_gen(data_path: str, output_config: str = "config.yaml"):
     with open(output_config, 'w') as f:
         yaml.dump(config, f, sort_keys=False)
         
-    print(f"\nSuccess! Updated {output_config} with {len(pos_ids)} positive and {len(neg_ids)} negative classes.")
+    print(f"\nSuccess! Updated {output_config}")
+    print(f"  Positive: {len(pos_ids)} classes")
+    print(f"  Negative: {len(neg_ids)} classes")

@@ -3,6 +3,7 @@ from albumentations.pytorch import ToTensorV2
 import random
 import cv2
 import numpy as np
+import torch
 from typing import Dict, Any
 
 def get_transforms(config: Dict[str, Any], is_training: bool = True):
@@ -113,6 +114,8 @@ class RandomOcclusion(A.ImageOnlyTransform):
                 num_pts = random.randint(3, 6)
                 pts = np.array([[random.randint(x, x + sw), random.randint(y, y + sh)] for _ in range(num_pts)])
                 cv2.fillPoly(img, [pts], color)
+
+        return img
         
 def mixup_data(x, y, alpha=1.0, device='cpu'):
     '''Returns mixed inputs, pairs of targets, and lambda'''

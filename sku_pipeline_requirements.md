@@ -117,7 +117,7 @@ input:
 
 # ── Sampling / Class Balance ──────────────────────────────────────────────────
 sampling:
-  pos_neg_ratio: "1:2"      # enforced per batch (batch-level ratio sampler)
+  pos_neg_ratio: "1:1"      # enforced per batch (batch-level ratio sampler)
   # Experiment: vary negative budget size to find minimum viable negative count
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -577,7 +577,7 @@ Every training run creates a timestamped folder — no external dependency (no w
 
 ```
 runs/
-└── 20240601_143022_focal_1to2/
+└── 20240601_143022_focal_1to1/
     ├── config.yaml               # exact config snapshot used for this run
     ├── train.log                 # full training log (metrics every N steps + epoch summary)
     ├── metrics.csv               # per-epoch: loss, acc, f1, precision, recall (train + val)
@@ -643,7 +643,7 @@ sku_classifier/
 │   ├── infer_batch.py          # batch inference (Mode A + B)
 │   ├── data/
 │   │   ├── dataset.py          # YOLOLabelDataset — reads labels, crops ROI, augments
-│   │   ├── sampler.py          # BatchRatioSampler (1:2 pos:neg enforcement)
+│   │   ├── sampler.py          # BatchRatioSampler (configurable pos:neg enforcement)
 │   │   ├── augment.py          # all augmentations incl. occlusion, cutpaste, mixup/cutmix
 │   │   └── extra_neg.py        # synthetic CutPaste + open-source negative loaders
 │   ├── models/

@@ -12,12 +12,9 @@ setup(
         "numpy",
         "opencv-python",
         "matplotlib",
-        "seaborn",
         "pandas",
         "scikit-learn",
         "tqdm",
-        "albumentations",
-        "questionary",
     ],
     entry_points={
         "console_scripts": [

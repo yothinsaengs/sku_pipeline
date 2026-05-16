@@ -1,185 +1,52 @@
 dataset:
-  images_dir: /Users/yothinsaengsakoon/Downloads/project-1884-at-2026-05-16-07-13-4222f076/images
-  labels_dir: /Users/yothinsaengsakoon/Downloads/project-1884-at-2026-05-16-07-13-4222f076/labels
   split:
-    train: 0.7
+    train: 0.70
     val: 0.15
     test: 0.15
   split_seed: 42
-classes:
-- id: 0
-  name: BEAR_BRAND_ENRICH_PINK_MILK_170ML
-  role: positive
-- id: 2
-  name: BEAR_BRAND_HONEY_UHT_180ML
-  role: positive
-- id: 8
-  name: BEAR_BRAND_ORIGINAL_UHT_180ML
-  role: positive
-- id: 33
-  name: MILO_ORIGINAL_UHT_180ML
-  role: positive
-- id: 44
-  name: OVALTINE_UHT_180ML
-  role: positive
-- id: 12
-  name: BEAR_BRAND_SWEET_UHT_165ML
-  role: negative
-- id: 16
-  name: DUTCHMILL_CHOCOLATE_UHT_180ML
-  role: negative
-- id: 17
-  name: DUTCHMILL_CHOCOLATE_UHT_225ML
-  role: negative
+
+experiment:
+  negative_class_name: GENERAL_SKU_SINGLE
+  negative_class_ids: []
+  negative_iou_threshold: 0.3
+  negative_fractions: [0.10, 0.20, 0.50, 1.00]
+
 label_smoothing: 0.1
+
 input:
+  sizes: [56, 112, 224]
   min_size: 4
-  max_size: 224
-  context_margin: 0.15
+  context_margin: 0.0
   pad_color: 114
+
 sampling:
-  pos_neg_ratio: '1:1'
+  pos_neg_ratio: "1:1"
+
 model:
   backbone: mobilenetv4_conv_medium.e500_r224_in1k
   pretrained: true
   head:
     global_pool: avg
     dropout: 0.3
-  num_classes: 5
+  num_classes: 1
+
 training:
   epochs: 50
   batch_size: 32
   optimizer: adamw
   lr: 0.0003
   weight_decay: 0.01
-  scheduler: cosine
   device: auto
-  multiscale: true
-  finetune: all
-  early_stopping:
-    enabled: true
-    monitor: val_f1_macro
-    patience: 10
-    min_delta: 0.001
-  resume:
-    enabled: false
-    checkpoint_path: ''
-  sanity_check:
-    enabled: true
-    num_batches: 2
-  log_every_n_steps: 50
-  checkpoints:
-    keep_last_n: 3
-    save_dir: checkpoints
-  auto_eval_after_train: true
   num_workers: 0
-wandb:
-  enabled: false
-  project: sku_classifier
-  log:
-  - loss
-  - acc
-  - f1_macro
-  - precision_macro
-  - recall_macro
+
 loss:
   type: focal
   focal:
     alpha: 0.25
     gamma: 2.0
+
 threshold: 0.5
-augmentation:
-  safe:
-    horizontal_flip: true
-    vertical_flip: false
-    color_jitter:
-      brightness: 0.2
-      contrast: 0.2
-      saturation: 0.2
-      hue: 0.05
-    random_rotation_deg: 15
-  random_mix:
-  - name: aggressive_color_jitter
-    prob: 0.3
-    params:
-      brightness: 0.5
-      contrast: 0.5
-      saturation: 0.5
-  - name: slight_perspective
-    prob: 0.2
-    params:
-      distortion_scale: 0.2
-  - name: gaussian_blur
-    prob: 0.2
-    params:
-      kernel_size: 3
-  random_occlusion:
-    enabled: true
-    prob: 0.3
-    max_count: 4
-    shapes:
-    - rect
-    - ellipse
-    - polygon
-    scale_range:
-    - 0.05
-    - 0.25
-    fill: random
-  class_mixing:
-    enabled: true
-    strategy: both
-    pairs: neg_pos
-    prob: 0.3
-    mixup:
-      alpha: 0.4
-    cutmix:
-      alpha: 1.0
-extra_negatives:
-  enabled: false
-  synthetic_cutpaste:
-    enabled: true
-    count_per_epoch: 500
-    shapes:
-    - rect
-    - ellipse
-    - polygon
-    scale_range:
-    - 0.05
-    - 0.3
-    source: non_roi_regions
-    paste_background: random_crop_same_image
-  open_source:
-  - name: coco_background
-    path: data/extra_neg/coco
-    type: random_crop
-    enabled: false
-  - name: openimages
-    path: data/extra_neg/openimages
-    type: random_crop
-    enabled: false
-  - name: sku110k_non_target
-    path: data/extra_neg/sku110k
-    type: random_crop
-    enabled: false
-  - name: dtd_textures
-    path: data/extra_neg/dtd
-    type: full_image
-    enabled: false
-  - name: places365
-    path: data/extra_neg/places365
-    type: random_crop
-    enabled: false
-  mix_ratio:
-    labeled: 0.5
-    synthetic: 0.3
-    open_source: 0.2
+
 logging:
   run_dir: runs
-  log_file: train.log
-  metrics_csv: true
-  plots: true
-  aug_preview:
-    enabled: true
-    num_samples: 16
-    save_file: aug_preview.png
-  cross_run_csv: runs/all_runs.csv
+  per_class_interval: 5

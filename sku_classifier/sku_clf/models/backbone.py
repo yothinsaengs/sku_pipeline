@@ -42,7 +42,8 @@ class SKUClassifier(nn.Module):
 
     def forward(self, x):
         x = self.backbone(x)
-        x = self.pool(x)
+        if x.ndim == 4:
+            x = self.pool(x)
         x = self.flatten(x)
         x = self.dropout(x)
         x = self.fc(x)

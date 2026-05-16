@@ -160,6 +160,19 @@ training:
     keep_last_n: 3                # keep last N epoch checkpoints + best model
     save_dir: "checkpoints"       # relative to run folder
 
+  auto_eval_after_train: true     # auto-run test set evaluation after training completes
+
+# ── WandB ─────────────────────────────────────────────────────────────────────
+wandb:
+  enabled: false                  # off by default — enable via --wandb flag at runtime
+  project: "sku_classifier"
+  log:
+    - loss
+    - acc
+    - f1_macro
+    - precision_macro
+    - recall_macro                # logged per epoch for train + val
+
 # ── Loss ──────────────────────────────────────────────────────────────────────
 loss:
   type: "focal"                   # options: "focal" | "bce"
@@ -194,6 +207,15 @@ augmentation:
     - name: "gaussian_blur"
       prob: 0.2
       params: { kernel_size: 3 }
+
+  # Random Occlusion — simulate partial obstruction of SKU crops
+  random_occlusion:
+    enabled: true
+    prob: 0.3                     # probability of applying per crop
+    max_count: 4                  # random number of occluders: 1 to max_count
+    shapes: ["rect", "ellipse", "polygon"]  # arbitrary shape types
+    scale_range: [0.05, 0.25]     # occluder size as fraction of crop size
+    fill: "random"                # fill color: "random" | "black" | "mean"
 
   # Class Mixing — neg+pos blending for smoother decision boundary
   class_mixing:
@@ -274,11 +296,42 @@ logging:
   log_file: "train.log"          # saved inside run folder (console output redirected here)
   metrics_csv: true
   plots: true                     # seaborn/matplotlib plots saved per run
+  aug_preview:
+    enabled: true                 # save grid of augmented crops before training starts
+    num_samples: 16               # number of crops to show in grid
+    save_file: "aug_preview.png"  # saved to run folder
+  cross_run_csv: "runs/all_runs.csv"  # append per-run summary metrics for easy comparison
 ```
 
 ---
 
-## 5. Model Architecture
+## 5. Config Validation
+
+Before any training starts, the CLI validates `config.yaml` and raises clear, descriptive
+errors if values are invalid. Validation runs automatically on `train` and `eval` commands.
+
+**Checks include:**
+
+| Check | Example error |
+|---|---|
+| Required fields present | `missing field: classes` |
+| Class roles valid | `role must be "positive" or "negative", got "pos"` |
+| Fractions sum correctly | `class_split pos_fraction + neg_fraction must be ≤ 1.0` |
+| Paths exist | `images_dir not found: dataset/images` |
+| Numeric ranges valid | `context_margin must be in [0, 1], got 1.5` |
+| Loss type recognized | `loss.type must be "focal" or "bce", got "mse"` |
+| Mix ratio sums to 1.0 | `extra_negatives.mix_ratio must sum to 1.0` |
+| At least one positive class | `no classes with role: positive defined` |
+
+Errors include the offending key path and suggested fix:
+```
+ConfigError: training.early_stopping.patience must be > 0, got -1
+  → set a positive integer, e.g. patience: 10
+```
+
+---
+
+## 6. Model Architecture
 
 ### 5.1 Backbone
 - **EfficientNetV2-S** (or M/L — configurable via `config.yaml`) loaded from `timm`, pretrained on ImageNet
@@ -314,7 +367,7 @@ Sigmoid   ← independent binary probability per positive class
 
 ---
 
-## 6. Loss Functions (Experiment Ablation)
+## 7. Loss Functions (Experiment Ablation)
 
 Both implemented and switchable via `config.yaml → loss.type`.
 
@@ -335,7 +388,7 @@ target_smooth = 0.0        for negative
 
 ---
 
-## 7. Sampling Strategy
+## 8. Sampling Strategy
 
 ### 7.1 Batch-Level Ratio Sampler
 - Enforce **1 positive : 2 negative** ratio per batch
@@ -355,6 +408,23 @@ Procedure:
 
 This is **controlled ratio sampling**, not hard negative mining (which requires active selection
 of the model's worst-error negatives — deferred to future work).
+
+### 7.3 Random Occlusion Augmentation
+
+Simulates partial obstruction of SKU crops — common in retail scenes where products are
+partially blocked by hands, shelf edges, price tags, or other items.
+
+**Pipeline per crop:**
+1. Sample a random occluder count: `1` to `max_count`
+2. For each occluder, sample a shape: `rect`, `ellipse`, or `polygon`
+3. Sample occluder size from `scale_range` (fraction of crop size)
+4. Place at a random position within the crop
+5. Fill with: `random` color, `black`, or `mean` pixel value of the crop
+
+Configured under `config.yaml → augmentation.random_occlusion`.
+Applied as part of the safe/random_mix augmentation pipeline with its own `prob`.
+
+---
 
 ### 7.4 Class Mixing Augmentation (MixUp / CutMix)
 
@@ -413,7 +483,7 @@ negative classes used, to identify the minimum negative class coverage needed fo
 
 ---
 
-## 8. Extra Negative Sources
+## 9. Extra Negative Sources
 
 To improve generalization of the negative signal — especially for unseen classes at inference —
 two tiers of additional negatives can be mixed into training alongside labeled negatives.
@@ -465,7 +535,7 @@ Adjustable in `config.yaml → extra_negatives.mix_ratio`.
 
 ---
 
-## 9. Metrics & Evaluation
+## 10. Metrics & Evaluation
 
 All metrics computed **per class** and **macro/weighted aggregated**. Saved to the run folder.
 
@@ -485,7 +555,7 @@ Decision threshold: **fixed at 0.5** for POC. Per-class threshold tuning deferre
 
 ---
 
-## 10. Plots (seaborn / matplotlib)
+## 11. Plots (seaborn / matplotlib)
 
 All plots saved as `.png` inside the timestamped run folder.
 
@@ -501,7 +571,7 @@ All plots saved as `.png` inside the timestamped run folder.
 
 ---
 
-## 11. Experiment Tracking & Logging
+## 12. Experiment Tracking & Logging
 
 Every training run creates a timestamped folder — no external dependency (no wandb).
 
@@ -536,7 +606,7 @@ Run folder naming: `YYYYMMDD_HHMMSS_<loss_type>_<pos_neg_ratio>`
 
 ---
 
-## 12. Device Compatibility
+## 13. Device Compatibility
 
 | Environment | Device | Purpose |
 |---|---|---|
@@ -558,63 +628,115 @@ memory differences between Colab GPU and Mac CPU.
 
 ---
 
-## 13. Suggested Project Structure
+## 14. Suggested Project Structure
 
 ```
 sku_classifier/
-├── config.yaml
-├── train.py
-├── evaluate.py
-├── infer.py                    # run full two-stage pipeline on a single image
-├── data/
-│   ├── dataset.py              # YOLOLabelDataset — reads labels, crops ROI, augments
-│   └── sampler.py              # BatchRatioSampler (1:2 pos:neg enforcement)
-├── models/
-│   ├── backbone.py             # EfficientNetV2 + classification head
-│   └── loss.py                 # FocalLoss and BCE + label smoothing
-├── utils/
-│   ├── metrics.py              # all classification metrics (per-class + aggregated)
-│   ├── plots.py                # seaborn/matplotlib plot functions
-│   └── logger.py               # timestamped run folder, CSV logging, JSON summary
+├── setup.py                    # installable package — enables sku-clf CLI entry point
+├── config.yaml                 # default config (user copies and edits)
+├── sku_clf/
+│   ├── __main__.py             # python -m sku_clf entry point
+│   ├── cli.py                  # CLI argument parsing (argparse); flags override yaml
+│   ├── train.py                # training loop
+│   ├── evaluate.py             # evaluation on test set
+│   ├── infer.py                # single image inference (Mode A + B)
+│   ├── infer_batch.py          # batch inference (Mode A + B)
+│   ├── data/
+│   │   ├── dataset.py          # YOLOLabelDataset — reads labels, crops ROI, augments
+│   │   ├── sampler.py          # BatchRatioSampler (1:2 pos:neg enforcement)
+│   │   ├── augment.py          # all augmentations incl. occlusion, cutpaste, mixup/cutmix
+│   │   └── extra_neg.py        # synthetic CutPaste + open-source negative loaders
+│   ├── models/
+│   │   ├── backbone.py         # EfficientNetV2 + AdaptiveAvgPool head
+│   │   └── loss.py             # FocalLoss, BCE + label smoothing
+│   └── utils/
+│       ├── metrics.py          # all classification metrics (per-class + aggregated)
+│       ├── plots.py            # seaborn/matplotlib plot functions
+│       ├── logger.py           # timestamped run folder, CSV + log file
+│       └── io.py               # zip extraction, directory/file resolution
 └── runs/                       # auto-created per training run
 ```
 
+**Installation:**
+```bash
+pip install -e .
+```
+
+**Usage — both styles work identically:**
+```bash
+# CLI entry point
+sku-clf train  --config config.yaml --data dataset.zip --epochs 30
+sku-clf eval   --config config.yaml --checkpoint runs/.../best_model.pth
+sku-clf infer  --image img.jpg --boxes img.txt --checkpoint runs/.../best_model.pth
+sku-clf infer-batch --images_dir imgs/ --boxes_dir boxes/ --checkpoint runs/.../best_model.pth
+
+# Module style
+python -m sku_clf train  --config config.yaml --data dataset.zip
+python -m sku_clf infer  --crops crop.jpg --checkpoint runs/.../best_model.pth
+```
+
+**Flag override examples:**
+```bash
+sku-clf train --config config.yaml --lr 0.0001 --epochs 100 --loss focal
+# --flag values take priority over config.yaml
+```
+
+**Dataset input — zip or directory, both supported:**
+```bash
+sku-clf train --data dataset.zip      # auto-extracted before training
+sku-clf train --data dataset/         # directory used directly
+```
+Zip auto-extraction looks for `images/` and `labels/` inside the archive.
+
 ---
 
-## 14. Inference Pipeline
+## 15. Inference Pipeline
 
-### 14.1 Single-Image Inference (`infer.py`)
+Two input modes supported by both `infer` and `infer-batch` commands:
 
-Runs the full two-stage pipeline on a single image file.
-
-**Input:** image path + optional pre-computed bboxes (from Stage 1 detector)
-**Output:** list of `{ bbox, class_name, confidence }` per detected ROI
-
-```
-python infer.py --image path/to/img.jpg --checkpoint runs/.../checkpoints/best_model.pth --config config.yaml
-```
-
-Steps:
-1. Load image
-2. Accept bboxes from Stage 1 detector output (JSON) or run a bundled detector if provided
-3. For each bbox: expand by `context_margin` → letterbox pad → resize → classify
-4. Apply threshold (0.5) — suppress ROIs below threshold
-5. Print results to stdout + optionally save annotated image
-
-### 14.2 Batch Inference (`infer_batch.py`)
-
-Runs inference on a folder of images.
+### Mode A — Image + YOLO Boxes File
+Provide a raw image and a YOLO-format `.txt` boxes file.
+Class index in the boxes file is **ignored** — all boxes are treated as ROIs.
 
 ```
-python infer_batch.py --images_dir path/to/folder/ --checkpoint runs/.../checkpoints/best_model.pth --config config.yaml --output_dir results/
+sku-clf infer --image img.jpg --boxes img.txt --checkpoint runs/.../best_model.pth
 ```
 
-**Output per image:** a `.json` file with all ROI predictions
-**Summary:** `batch_summary.csv` — one row per image with counts of each class detected
+Box file format (class index ignored):
+```
+<ignored_class_id> <x_center> <y_center> <width> <height>
+```
+
+### Mode B — Pre-Cropped Images
+Provide already-cropped ROI images directly — skips the bbox expansion step entirely.
+
+```
+sku-clf infer --crops path/to/crop.jpg --checkpoint runs/.../best_model.pth
+sku-clf infer-batch --crops_dir path/to/crops/ --checkpoint runs/.../best_model.pth
+```
+
+### 14.1 Single Inference (`infer`)
+
+```
+sku-clf infer --image img.jpg --boxes img.txt --checkpoint runs/.../best_model.pth --config config.yaml
+```
+
+**Output:** prints `{ bbox, class_name, confidence }` per ROI to stdout.
+Optionally saves annotated image with `--save_vis output.jpg`.
+
+### 14.2 Batch Inference (`infer-batch`)
+
+```
+sku-clf infer-batch --images_dir path/to/images/ --boxes_dir path/to/boxes/ \
+    --checkpoint runs/.../best_model.pth --output_dir results/
+```
+
+**Output per image:** `.json` file with all ROI predictions
+**Summary:** `batch_summary.csv` — one row per image, count per detected class
 
 ---
 
-## 15. Open Questions / Future Work
+## 16. Open Questions / Future Work
 
 - Stage 1 (General SKU Detector) training spec — out of scope for POC
 - Per-class confidence threshold tuning post-POC

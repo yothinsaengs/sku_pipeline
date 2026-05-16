@@ -218,6 +218,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, help="Override pretrained backbone flag")
     parser.add_argument("--negative-fractions", nargs="+", type=float, help="Override negative fractions, e.g. 0.1 0.2 0.5 1.0")
     parser.add_argument("--per-class-interval", type=int, help="Override per-class metrics save interval")
+    parser.add_argument("--macro-min-support", type=int, help="Ignore classes with lower support for main macro metrics")
+    parser.add_argument("--class-pos-weight", action=argparse.BooleanOptionalAction, help="Enable/disable positive class loss weighting")
+    parser.add_argument("--tune-thresholds", action=argparse.BooleanOptionalAction, help="Enable/disable validation threshold tuning")
     return parser.parse_args()
 
 
@@ -245,6 +248,12 @@ def apply_overrides(config: Dict[str, Any], args: argparse.Namespace) -> None:
         config.setdefault("experiment", {})["negative_fractions"] = args.negative_fractions
     if args.per_class_interval is not None:
         config.setdefault("logging", {})["per_class_interval"] = args.per_class_interval
+    if args.macro_min_support is not None:
+        config.setdefault("metrics", {})["macro_min_support"] = args.macro_min_support
+    if args.class_pos_weight is not None:
+        config.setdefault("loss", {}).setdefault("class_pos_weight", {})["enabled"] = args.class_pos_weight
+    if args.tune_thresholds is not None:
+        config.setdefault("metrics", {}).setdefault("tune_thresholds", {})["enabled"] = args.tune_thresholds
 
 
 if __name__ == "__main__":

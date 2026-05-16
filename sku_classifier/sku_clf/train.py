@@ -62,11 +62,16 @@ def train_fraction_run(
 
     device = resolve_device(config)
     model = get_model(config).to(device)
-    criterion = get_loss_fn(config)
+    pos_weights = compute_class_pos_weights(train_samples, positive_ids, config).to(device)
+    criterion = get_loss_fn(config, pos_weights=pos_weights)
     optimizer = build_optimizer(model, config)
     epochs = int(config.get("training", {}).get("epochs", 50))
     scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
     threshold = float(config.get("threshold", 0.5))
+    metrics_cfg = config.get("metrics", {})
+    macro_min_support = int(metrics_cfg.get("macro_min_support", 5))
+    threshold_candidates = [float(value) for value in metrics_cfg.get("tune_thresholds", {}).get("candidates", [0.1, 0.3, 0.5, 0.7, 0.9])]
+    tune_thresholds_enabled = bool(metrics_cfg.get("tune_thresholds", {}).get("enabled", True))
     scales = [int(size) for size in config.get("input", {}).get("sizes", [56, 112, 224])]
     sanity_check_batch(train_ds, config, scales, positive_ids, fraction)
     write_pretrain_summary(
@@ -93,8 +98,17 @@ def train_fraction_run(
         test_scale_rows = []
         per_class_rows = []
         for scale in scales:
-            val_loss, val_metrics, val_per_class = evaluate(model, val_ds, criterion, device, threshold, scale)
-            test_loss, test_metrics, test_per_class = evaluate(model, test_ds, criterion, device, threshold, scale)
+            val_loss, val_outputs, val_targets = evaluate_outputs(model, val_ds, criterion, device, scale)
+            tuned_thresholds = tune_per_class_thresholds(
+                val_outputs,
+                val_targets,
+                threshold_candidates,
+                macro_min_support,
+                default_threshold=threshold,
+            ) if tune_thresholds_enabled else np.full(len(positive_ids), threshold, dtype=np.float32)
+            val_metrics, val_per_class = calculate_metrics(val_outputs, val_targets, tuned_thresholds, macro_min_support=macro_min_support)
+            test_loss, test_outputs, test_targets = evaluate_outputs(model, test_ds, criterion, device, scale)
+            test_metrics, test_per_class = calculate_metrics(test_outputs, test_targets, tuned_thresholds, macro_min_support=macro_min_support)
             val_row = prefixed_row(val_metrics, "val")
             test_row = prefixed_row(test_metrics, "test")
             row = {
@@ -104,6 +118,7 @@ def train_fraction_run(
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "test_loss": test_loss,
+                **threshold_row(tuned_thresholds, "threshold"),
                 **val_row,
                 **test_row,
             }
@@ -114,6 +129,7 @@ def train_fraction_run(
             if epoch % per_class_interval == 0:
                 per_class_rows.extend(format_per_class(epoch, fraction, scale, "val", val_per_class, positive_names))
                 per_class_rows.extend(format_per_class(epoch, fraction, scale, "test", test_per_class, positive_names))
+                per_class_rows.extend(format_thresholds(epoch, fraction, scale, tuned_thresholds, positive_names))
 
         pd.DataFrame(epoch_rows).to_csv(run_dir / "epoch_metrics.csv", index=False)
         if per_class_rows:
@@ -137,8 +153,17 @@ def train_fraction_run(
         model.load_state_dict(checkpoint["model_state_dict"])
 
     for scale in scales:
-        loss, metrics, _ = evaluate(model, test_ds, criterion, device, threshold, scale)
-        final_test_rows.append({"negative_fraction": fraction, "scale": scale, "test_loss": loss, **metrics})
+        val_loss, val_outputs, val_targets = evaluate_outputs(model, val_ds, criterion, device, scale)
+        tuned_thresholds = tune_per_class_thresholds(
+            val_outputs,
+            val_targets,
+            threshold_candidates,
+            macro_min_support,
+            default_threshold=threshold,
+        ) if tune_thresholds_enabled else np.full(len(positive_ids), threshold, dtype=np.float32)
+        loss, test_outputs, test_targets = evaluate_outputs(model, test_ds, criterion, device, scale)
+        metrics, _ = calculate_metrics(test_outputs, test_targets, tuned_thresholds, macro_min_support=macro_min_support)
+        final_test_rows.append({"negative_fraction": fraction, "scale": scale, "test_loss": loss, **threshold_row(tuned_thresholds, "threshold"), **metrics})
     pd.DataFrame(final_test_rows).to_csv(run_dir / "final_test_metrics_by_scale.csv", index=False)
     with (run_dir / "run_summary.json").open("w") as f:
         json.dump({"negative_fraction": fraction, "best_val_f1_macro": best_val_f1}, f, indent=2)
@@ -155,6 +180,30 @@ def build_optimizer(model: torch.nn.Module, config: Dict[str, Any]):
     if name == "sgd":
         return optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
     return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+
+def compute_class_pos_weights(samples: Sequence[Dict[str, Any]], positive_ids: Sequence[int], config: Dict[str, Any]) -> torch.Tensor:
+    weight_cfg = config.get("loss", {}).get("class_pos_weight", {})
+    counts = np.zeros(len(positive_ids), dtype=np.float32)
+    id_to_idx = {class_id: index for index, class_id in enumerate(positive_ids)}
+    for sample in samples:
+        if sample.get("role") == "positive" and sample.get("class_id") in id_to_idx:
+            counts[id_to_idx[sample["class_id"]]] += 1
+    weights = np.ones(len(positive_ids), dtype=np.float32)
+    if weight_cfg.get("enabled", True) and len(counts) > 0:
+        nonzero = counts[counts > 0]
+        if nonzero.size == 0:
+            raise ValueError("Cannot compute class positive weights: no positive train samples")
+        max_count = float(nonzero.max())
+        for index, count in enumerate(counts):
+            if count <= 0:
+                weights[index] = float(weight_cfg.get("max_weight", 10.0))
+            elif weight_cfg.get("strategy", "inv_sqrt") == "inverse":
+                weights[index] = max_count / float(count)
+            else:
+                weights[index] = np.sqrt(max_count / float(count))
+        weights = np.minimum(weights, float(weight_cfg.get("max_weight", 10.0)))
+    return torch.tensor(weights, dtype=torch.float32)
 
 
 def count_by_role(samples: Sequence[Dict[str, Any]]) -> Dict[str, int]:
@@ -210,6 +259,7 @@ def write_pretrain_summary(
     ratio = config.get("sampling", {}).get("pos_neg_ratio", "1:1")
     sampler = BatchRatioSampler(list(train_samples), batch_size, ratio)
     model_stats = model_size_summary(model)
+    class_pos_weights = compute_class_pos_weights(train_samples, positive_ids, config).cpu().numpy()
     rows = []
     for split_name, samples in (("train", train_samples), ("val", val_samples), ("test", test_samples)):
         role_counts = count_by_role(samples)
@@ -224,6 +274,7 @@ def write_pretrain_summary(
             "background_sample_count": role_counts["background"],
             "positive_class_count": len(positive_ids),
             "positive_classes": "|".join(f"{class_id}:{positive_names[index]}" for index, class_id in enumerate(positive_ids)),
+            "class_pos_weights": "|".join(f"{positive_ids[index]}:{positive_names[index]}={class_pos_weights[index]:.6f}" for index in range(len(positive_ids))),
             "positive_box_counts_by_class": count_boxes_by_class(samples, positive_ids, positive_names),
             "batch_size": batch_size,
             "train_batch_count": sampler.num_batches if split_name == "train" else math.ceil(len(samples) / batch_size),
@@ -243,6 +294,7 @@ def write_pretrain_summary(
         f"  test images/samples: {rows[2]['image_count']} images, {rows[2]['sample_count']} samples "
         f"({rows[2]['positive_sample_count']} pos, {rows[2]['negative_sample_count']} neg)",
         f"  batch: size={batch_size}, train_batches={sampler.num_batches}, pos_per_batch={sampler.num_pos_per_batch}, neg_per_batch={sampler.num_neg_per_batch}",
+        f"  class_pos_weight: enabled={config.get('loss', {}).get('class_pos_weight', {}).get('enabled', True)}",
         f"  model: params={model_stats['parameter_count']}, trainable={model_stats['trainable_parameter_count']}, weight_size_mb={model_stats['weight_size_mb']}",
     ]
     text = "\n".join(lines) + "\n"
@@ -299,7 +351,7 @@ def train_one_epoch(model, dataset: SKUExperimentDataset, config: Dict[str, Any]
     return float(np.mean(losses)) if losses else 0.0
 
 
-def evaluate(model, dataset: SKUExperimentDataset, criterion, device, threshold: float, scale: int):
+def evaluate_outputs(model, dataset: SKUExperimentDataset, criterion, device, scale: int):
     dataset.set_fixed_size(scale)
     loader = make_loader(dataset, dataset.config, training=False)
     model.eval()
@@ -317,8 +369,43 @@ def evaluate(model, dataset: SKUExperimentDataset, criterion, device, threshold:
             targets_all.append(hard_targets.numpy())
     outputs_np = np.concatenate(outputs_all, axis=0) if outputs_all else np.array([])
     targets_np = np.concatenate(targets_all, axis=0) if targets_all else np.array([])
-    metrics, per_class = calculate_metrics(outputs_np, targets_np, threshold)
-    return float(np.mean(losses)) if losses else 0.0, metrics, per_class
+    return float(np.mean(losses)) if losses else 0.0, outputs_np, targets_np
+
+
+def tune_per_class_thresholds(
+    outputs: np.ndarray,
+    hard_targets: np.ndarray,
+    candidates: Sequence[float],
+    min_support: int,
+    default_threshold: float,
+) -> np.ndarray:
+    if outputs.size == 0 or hard_targets.size == 0:
+        return np.full(0, default_threshold, dtype=np.float32)
+    thresholds = np.full(outputs.shape[1], default_threshold, dtype=np.float32)
+    for class_index in range(outputs.shape[1]):
+        y_true = hard_targets[:, class_index]
+        support = int(y_true.sum())
+        if support < min_support or np.unique(y_true).size < 2:
+            continue
+        best_threshold = default_threshold
+        best_f1 = -1.0
+        for candidate in candidates:
+            y_pred = (outputs[:, class_index] >= candidate).astype(np.int32)
+            tp = int(((y_pred == 1) & (y_true == 1)).sum())
+            fp = int(((y_pred == 1) & (y_true == 0)).sum())
+            fn = int(((y_pred == 0) & (y_true == 1)).sum())
+            precision = tp / (tp + fp) if tp + fp else 0.0
+            recall = tp / (tp + fn) if tp + fn else 0.0
+            f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = candidate
+        thresholds[class_index] = best_threshold
+    return thresholds
+
+
+def threshold_row(thresholds: np.ndarray, prefix: str) -> Dict[str, float]:
+    return {f"{prefix}_class_{index}": float(value) for index, value in enumerate(thresholds)}
 
 
 def prefixed_row(metrics: Dict[str, Any], prefix: str) -> Dict[str, Any]:
@@ -346,3 +433,30 @@ def format_per_class(
             "class_name": class_name,
         })
     return formatted
+
+
+def format_thresholds(
+    epoch: int,
+    fraction: float,
+    scale: int,
+    thresholds: np.ndarray,
+    positive_names: Sequence[str],
+) -> List[Dict[str, Any]]:
+    return [
+        {
+            "epoch": epoch,
+            "negative_fraction": fraction,
+            "scale": scale,
+            "split": "threshold",
+            "class_index": index,
+            "class_name": positive_names[index],
+            "support": "",
+            "included_in_macro": "",
+            "precision": "",
+            "recall": "",
+            "f1": "",
+            "roc_auc": "",
+            "selected_threshold": float(threshold),
+        }
+        for index, threshold in enumerate(thresholds)
+    ]

@@ -41,11 +41,21 @@ training:
 
 loss:
   type: focal
+  class_pos_weight:
+    enabled: true
+    strategy: inv_sqrt
+    max_weight: 10.0
   focal:
     alpha: 0.25
     gamma: 2.0
 
 threshold: 0.5
+
+metrics:
+  macro_min_support: 5
+  tune_thresholds:
+    enabled: true
+    candidates: [0.10, 0.30, 0.50, 0.70, 0.90]
 
 logging:
   run_dir: runs

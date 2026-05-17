@@ -59,6 +59,10 @@ metrics:
     enabled: true
     candidates: [0.10, 0.30, 0.50, 0.70, 0.90]
 
+quantization:
+  int8_dynamic:
+    enabled: true
+
 logging:
   run_dir: runs
   per_class_interval: 5

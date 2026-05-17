@@ -92,6 +92,7 @@ def train_fraction_run(
     best_val_f1 = -1.0
     epoch_rows = []
     final_test_rows = []
+    final_int8_rows = []
 
     for epoch in range(1, epochs + 1):
         train_loss = train_one_epoch(model, train_ds, config, criterion, optimizer, device, epoch, epochs, scales)
@@ -168,9 +169,31 @@ def train_fraction_run(
         metrics, _ = calculate_metrics(test_outputs, test_targets, tuned_thresholds, macro_min_support=macro_min_support)
         final_test_rows.append({"negative_fraction": fraction, "scale": scale, "test_loss": loss, **threshold_row(tuned_thresholds, "threshold"), **metrics})
     pd.DataFrame(final_test_rows).to_csv(run_dir / "final_test_metrics_by_scale.csv", index=False)
+
+    if config.get("quantization", {}).get("int8_dynamic", {}).get("enabled", True):
+        int8_model = quantize_model_int8(model)
+        int8_path = run_dir / "checkpoints" / "best_model_int8_dynamic.pth"
+        torch.save({"model_state_dict": int8_model.state_dict(), "config": config, "quantization": "dynamic_int8"}, int8_path)
+        append_log(run_dir.parent, f"Saved INT8 dynamic checkpoint: {int8_path}")
+        int8_criterion = get_loss_fn(config, pos_weights=pos_weights.cpu())
+        for scale in eval_scales:
+            val_loss, val_outputs, val_targets = evaluate_outputs(int8_model, val_ds, int8_criterion, torch.device("cpu"), scale)
+            tuned_thresholds = tune_per_class_thresholds(
+                val_outputs,
+                val_targets,
+                threshold_candidates,
+                macro_min_support,
+                default_threshold=threshold,
+            ) if tune_thresholds_enabled else np.full(len(positive_ids), threshold, dtype=np.float32)
+            loss, test_outputs, test_targets = evaluate_outputs(int8_model, test_ds, int8_criterion, torch.device("cpu"), scale)
+            metrics, _ = calculate_metrics(test_outputs, test_targets, tuned_thresholds, macro_min_support=macro_min_support)
+            final_int8_rows.append({"negative_fraction": fraction, "scale": scale, "test_loss": loss, **threshold_row(tuned_thresholds, "threshold"), **metrics})
+        pd.DataFrame(final_int8_rows).to_csv(run_dir / "final_test_metrics_by_scale_int8_dynamic.csv", index=False)
+        append_log(run_dir.parent, f"Wrote INT8 dynamic final test metrics: {run_dir / 'final_test_metrics_by_scale_int8_dynamic.csv'}")
+
     with (run_dir / "run_summary.json").open("w") as f:
         json.dump({"negative_fraction": fraction, "best_val_f1_macro": best_val_f1}, f, indent=2)
-    return {"negative_fraction": fraction, "best_val_f1_macro": best_val_f1, "final_test_rows": final_test_rows}
+    return {"negative_fraction": fraction, "best_val_f1_macro": best_val_f1, "final_test_rows": final_test_rows, "final_int8_rows": final_int8_rows}
 
 
 def build_optimizer(model: torch.nn.Module, config: Dict[str, Any]):
@@ -183,6 +206,18 @@ def build_optimizer(model: torch.nn.Module, config: Dict[str, Any]):
     if name == "sgd":
         return optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
     return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+
+def quantize_model_int8(model: torch.nn.Module) -> torch.nn.Module:
+    supported = list(getattr(torch.backends.quantized, "supported_engines", []))
+    for engine in ("fbgemm", "x86", "qnnpack"):
+        if engine in supported:
+            torch.backends.quantized.engine = engine
+            break
+    if torch.backends.quantized.engine == "none":
+        raise RuntimeError(f"No PyTorch quantized backend available. supported_engines={supported}")
+    cpu_model = model.to("cpu").eval()
+    return torch.quantization.quantize_dynamic(cpu_model, {torch.nn.Linear}, dtype=torch.qint8)
 
 
 def compute_class_pos_weights(samples: Sequence[Dict[str, Any]], positive_ids: Sequence[int], config: Dict[str, Any]) -> torch.Tensor:

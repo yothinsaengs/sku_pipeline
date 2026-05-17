@@ -10,6 +10,7 @@ experiment:
   negative_class_ids: []
   negative_iou_threshold: 0.3
   negative_fractions: [0.10, 0.20, 0.50, 1.00]
+  max_train_positive_per_class:
 
 label_smoothing: 0.1
 

@@ -31,6 +31,29 @@ def sample_negatives(candidates: Sequence[Dict[str, Any]], fraction: float, seed
     return random.Random(seed).sample(list(candidates), min(count, len(candidates)))
 
 
+def cap_train_positives_per_class(
+    positives: Sequence[Dict[str, Any]],
+    max_per_class: int | None,
+    seed: int,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if max_per_class is None or max_per_class <= 0:
+        return list(positives), []
+    rng = random.Random(seed)
+    by_class: Dict[int, List[Dict[str, Any]]] = {}
+    for sample in positives:
+        by_class.setdefault(int(sample["class_id"]), []).append(sample)
+    selected = []
+    unused = []
+    for class_id, samples in sorted(by_class.items()):
+        shuffled = list(samples)
+        rng.shuffle(shuffled)
+        selected.extend(shuffled[:max_per_class])
+        unused.extend(shuffled[max_per_class:])
+    selected.sort(key=lambda sample: (sample.get("class_id", -1), sample.get("stem", ""), sample.get("bbox", [])))
+    unused.sort(key=lambda sample: (sample.get("class_id", -1), sample.get("stem", ""), sample.get("bbox", [])))
+    return selected, unused
+
+
 def sample_to_row(sample: Dict[str, Any], split: str, index: int) -> Dict[str, Any]:
     xc, yc, bw, bh = sample["bbox"]
     return {
@@ -96,6 +119,27 @@ def write_dataset_summary(
                 f"{class_id}:{id_to_name.get(class_id, f'class_{class_id}')}={count}"
                 for class_id, count in sorted(class_box_counts.items())
             ),
+        })
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def write_positive_cap_summary(
+    path: Path,
+    selected: Sequence[Dict[str, Any]],
+    unused: Sequence[Dict[str, Any]],
+    id_to_name: Dict[int, str],
+) -> None:
+    rows = []
+    class_ids = sorted({int(sample["class_id"]) for sample in list(selected) + list(unused)})
+    for class_id in class_ids:
+        selected_count = sum(1 for sample in selected if int(sample["class_id"]) == class_id)
+        unused_count = sum(1 for sample in unused if int(sample["class_id"]) == class_id)
+        rows.append({
+            "class_id": class_id,
+            "class_name": id_to_name.get(class_id, f"class_{class_id}"),
+            "selected_train_positive_boxes": selected_count,
+            "unused_train_positive_boxes": unused_count,
+            "original_train_positive_boxes": selected_count + unused_count,
         })
     pd.DataFrame(rows).to_csv(path, index=False)
 
@@ -168,6 +212,19 @@ def run_experiment(config: Dict[str, Any], data_path: str, output_dir: str) -> N
     append_log(output_root, "Wrote candidate_summary.csv and dataset_summary.csv")
 
     train_positive = split_samples["train"]["positives"]
+    max_pos_per_class = config.get("experiment", {}).get("max_train_positive_per_class")
+    train_positive, unused_train_positive = cap_train_positives_per_class(
+        train_positive,
+        int(max_pos_per_class) if max_pos_per_class is not None else None,
+        seed + 9001,
+    )
+    write_manifest(output_root / "selected_train_positive_manifest.csv", train_positive, "train")
+    write_manifest(output_root / "unused_train_positive_manifest.csv", unused_train_positive, "train")
+    write_positive_cap_summary(output_root / "positive_cap_summary.csv", train_positive, unused_train_positive, id_to_name)
+    append_log(
+        output_root,
+        f"Train positives selected={len(train_positive)}, unused={len(unused_train_positive)}, max_per_class={max_pos_per_class}",
+    )
     train_candidates = split_samples["train"]["negative_boxes"] + split_samples["train"]["background"]
     val_samples = split_samples["val"]["positives"] + split_samples["val"]["negative_boxes"] + split_samples["val"]["background"]
     test_samples = split_samples["test"]["positives"] + split_samples["test"]["negative_boxes"] + split_samples["test"]["background"]
@@ -217,6 +274,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone", help="Override timm backbone")
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, help="Override pretrained backbone flag")
     parser.add_argument("--negative-fractions", nargs="+", type=float, help="Override negative fractions, e.g. 0.1 0.2 0.5 1.0")
+    parser.add_argument("--max-train-positive-per-class", type=int, help="Use at most N train positive boxes per class, fixed for all epochs")
     parser.add_argument("--scales", nargs="+", help="Override input scales, e.g. --scales 56 or --scales 56,112 or --scales 112 224")
     parser.add_argument("--per-class-interval", type=int, help="Override per-class metrics save interval")
     parser.add_argument("--macro-min-support", type=int, help="Ignore classes with lower support for main macro metrics")
@@ -247,6 +305,8 @@ def apply_overrides(config: Dict[str, Any], args: argparse.Namespace) -> None:
         config.setdefault("model", {})["pretrained"] = args.pretrained
     if args.negative_fractions is not None:
         config.setdefault("experiment", {})["negative_fractions"] = args.negative_fractions
+    if args.max_train_positive_per_class is not None:
+        config.setdefault("experiment", {})["max_train_positive_per_class"] = args.max_train_positive_per_class
     if args.scales is not None:
         config.setdefault("input", {})["sizes"] = parse_scales(args.scales)
     if args.per_class_interval is not None:

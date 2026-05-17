@@ -217,6 +217,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone", help="Override timm backbone")
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, help="Override pretrained backbone flag")
     parser.add_argument("--negative-fractions", nargs="+", type=float, help="Override negative fractions, e.g. 0.1 0.2 0.5 1.0")
+    parser.add_argument("--scales", nargs="+", help="Override input scales, e.g. --scales 56 or --scales 56,112 or --scales 112 224")
     parser.add_argument("--per-class-interval", type=int, help="Override per-class metrics save interval")
     parser.add_argument("--macro-min-support", type=int, help="Ignore classes with lower support for main macro metrics")
     parser.add_argument("--class-pos-weight", action=argparse.BooleanOptionalAction, help="Enable/disable positive class loss weighting")
@@ -246,6 +247,8 @@ def apply_overrides(config: Dict[str, Any], args: argparse.Namespace) -> None:
         config.setdefault("model", {})["pretrained"] = args.pretrained
     if args.negative_fractions is not None:
         config.setdefault("experiment", {})["negative_fractions"] = args.negative_fractions
+    if args.scales is not None:
+        config.setdefault("input", {})["sizes"] = parse_scales(args.scales)
     if args.per_class_interval is not None:
         config.setdefault("logging", {})["per_class_interval"] = args.per_class_interval
     if args.macro_min_support is not None:
@@ -254,6 +257,23 @@ def apply_overrides(config: Dict[str, Any], args: argparse.Namespace) -> None:
         config.setdefault("loss", {}).setdefault("class_pos_weight", {})["enabled"] = args.class_pos_weight
     if args.tune_thresholds is not None:
         config.setdefault("metrics", {}).setdefault("tune_thresholds", {})["enabled"] = args.tune_thresholds
+
+
+def parse_scales(values: Sequence[str]) -> List[int]:
+    scales = []
+    for value in values:
+        for part in value.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            scale = int(part)
+            if scale <= 0:
+                raise ValueError(f"Scale must be positive, got {scale}")
+            scales.append(scale)
+    scales = list(dict.fromkeys(scales))
+    if not scales:
+        raise ValueError("--scales did not contain any valid scale")
+    return scales
 
 
 if __name__ == "__main__":

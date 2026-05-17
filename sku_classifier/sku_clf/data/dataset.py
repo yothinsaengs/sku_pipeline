@@ -167,7 +167,7 @@ class SKUExperimentDataset(Dataset):
         positive_ids: Sequence[int],
         config: Dict[str, Any],
         is_training: bool,
-        fixed_size: Optional[int] = None,
+        fixed_size: Optional[int | str] = None,
     ):
         self.samples = list(samples)
         self.positive_ids = list(positive_ids)
@@ -185,21 +185,33 @@ class SKUExperimentDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def set_fixed_size(self, size: Optional[int]) -> None:
+    def set_fixed_size(self, size: Optional[int | str]) -> None:
         self.fixed_size = size
 
     def __getitem__(self, idx: int):
         sample = self.samples[idx]
-        size = self.fixed_size or (random.choice(self.sizes) if self.is_training else max(self.sizes))
         image = cv2.imread(sample["image_path"])
         if image is None:
             raise FileNotFoundError(sample["image_path"])
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         crop = self._crop(image, sample["bbox"])
+        size = self._resolve_size(crop)
         crop = self._letterbox(crop, size)
         tensor = torch.from_numpy(crop).permute(2, 0, 1).float() / 255.0
         target, hard_target = self._targets(sample)
         return tensor, torch.from_numpy(target), torch.from_numpy(hard_target)
+
+    def _resolve_size(self, crop: np.ndarray) -> int:
+        if self.fixed_size == "dynamic":
+            max_side = max(crop.shape[:2])
+            if max_side <= 56:
+                return 56
+            if max_side <= 112:
+                return 112
+            return 224
+        if self.fixed_size:
+            return int(self.fixed_size)
+        return random.choice(self.sizes) if self.is_training else max(self.sizes)
 
     def _targets(self, sample: Dict[str, Any]):
         num_classes = len(self.positive_ids)

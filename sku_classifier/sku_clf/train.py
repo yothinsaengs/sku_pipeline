@@ -73,6 +73,9 @@ def train_fraction_run(
     threshold_candidates = [float(value) for value in metrics_cfg.get("tune_thresholds", {}).get("candidates", [0.1, 0.3, 0.5, 0.7, 0.9])]
     tune_thresholds_enabled = bool(metrics_cfg.get("tune_thresholds", {}).get("enabled", True))
     scales = [int(size) for size in config.get("input", {}).get("sizes", [56, 112, 224])]
+    eval_scales = list(scales)
+    if metrics_cfg.get("evaluate_dynamic_scale", True):
+        eval_scales.append("dynamic")
     sanity_check_batch(train_ds, config, scales, positive_ids, fraction)
     write_pretrain_summary(
         run_dir=run_dir,
@@ -97,7 +100,7 @@ def train_fraction_run(
         val_scale_rows = []
         test_scale_rows = []
         per_class_rows = []
-        for scale in scales:
+        for scale in eval_scales:
             val_loss, val_outputs, val_targets = evaluate_outputs(model, val_ds, criterion, device, scale)
             tuned_thresholds = tune_per_class_thresholds(
                 val_outputs,
@@ -152,7 +155,7 @@ def train_fraction_run(
         checkpoint = torch.load(best_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
 
-    for scale in scales:
+    for scale in eval_scales:
         val_loss, val_outputs, val_targets = evaluate_outputs(model, val_ds, criterion, device, scale)
         tuned_thresholds = tune_per_class_thresholds(
             val_outputs,
@@ -351,8 +354,10 @@ def train_one_epoch(model, dataset: SKUExperimentDataset, config: Dict[str, Any]
     return float(np.mean(losses)) if losses else 0.0
 
 
-def evaluate_outputs(model, dataset: SKUExperimentDataset, criterion, device, scale: int):
+def evaluate_outputs(model, dataset: SKUExperimentDataset, criterion, device, scale: int | str):
     dataset.set_fixed_size(scale)
+    if scale == "dynamic":
+        return evaluate_outputs_dynamic(model, dataset, criterion, device)
     loader = make_loader(dataset, dataset.config, training=False)
     model.eval()
     losses = []
@@ -367,6 +372,26 @@ def evaluate_outputs(model, dataset: SKUExperimentDataset, criterion, device, sc
             losses.append(float(loss.item()))
             outputs_all.append(outputs.cpu().numpy())
             targets_all.append(hard_targets.numpy())
+    outputs_np = np.concatenate(outputs_all, axis=0) if outputs_all else np.array([])
+    targets_np = np.concatenate(targets_all, axis=0) if targets_all else np.array([])
+    return float(np.mean(losses)) if losses else 0.0, outputs_np, targets_np
+
+
+def evaluate_outputs_dynamic(model, dataset: SKUExperimentDataset, criterion, device):
+    model.eval()
+    losses = []
+    outputs_all = []
+    targets_all = []
+    with torch.no_grad():
+        for index in range(len(dataset)):
+            inputs, targets, hard_targets = dataset[index]
+            inputs = inputs.unsqueeze(0).to(device)
+            targets = targets.unsqueeze(0).to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            losses.append(float(loss.item()))
+            outputs_all.append(outputs.cpu().numpy())
+            targets_all.append(hard_targets.unsqueeze(0).numpy())
     outputs_np = np.concatenate(outputs_all, axis=0) if outputs_all else np.array([])
     targets_np = np.concatenate(targets_all, axis=0) if targets_all else np.array([])
     return float(np.mean(losses)) if losses else 0.0, outputs_np, targets_np

@@ -147,11 +147,11 @@ def write_positive_cap_summary(
 def validate_raw_input_dataset(data_path: str, extract_to: Path) -> str:
     data_dir = extract_dataset(data_path, extract_to=str(extract_to))
     images_dir, labels_dir = resolve_data_paths(data_dir)
-    rmon_dir = Path(data_dir) / "rmon"
+    roi_dir = Path(data_dir) / "roi"
     classes_path = Path(data_dir) / "classes.txt"
     assert_dir(images_dir, "Input images")
     assert_dir(labels_dir, "Input labels")
-    assert_dir(str(rmon_dir), "Input rmon")
+    assert_dir(str(roi_dir), "Input roi")
     assert_file(str(classes_path), "Input classes.txt")
     return data_dir
 
@@ -166,10 +166,10 @@ def run_experiment(config: Dict[str, Any], data_path: str, output_dir: str) -> N
     raw_data_dir = validate_raw_input_dataset(data_path, output_root / "input_dataset")
     append_log(output_root, f"Validated raw dataset: {raw_data_dir}")
     merged_data_dir = output_root / "merged_dataset"
-    append_log(output_root, f"Merging YOLO labels and rmon files into: {merged_data_dir}")
+    append_log(output_root, f"Merging labels and roi files into: {merged_data_dir}")
     merge_human_and_roi_dataset(
         human_dataset=raw_data_dir,
-        roi_rmon_dir=str(Path(raw_data_dir) / "rmon"),
+        roi_dir=str(Path(raw_data_dir) / "roi"),
         out=str(merged_data_dir),
         roi_class_name=config.get("experiment", {}).get("negative_class_name", "GENERAL_SKU_SINGLE"),
         iou_threshold=float(config.get("experiment", {}).get("negative_iou_threshold", 0.3)),
@@ -263,8 +263,8 @@ def run_experiment(config: Dict[str, Any], data_path: str, output_dir: str) -> N
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Merge raw YOLO+rmon data, then run the SKU negative-fraction classifier experiment.")
-    parser.add_argument("--data", required=True, help="Raw dataset folder or zip containing images/, labels/, rmon/, classes.txt")
+    parser = argparse.ArgumentParser(description="Merge raw labels+roi data, then run the SKU negative-fraction classifier experiment.")
+    parser.add_argument("--data", required=True, help="Raw dataset folder or zip containing images/, labels/, roi/, classes.txt")
     parser.add_argument("--config", default="sku_classifier/config.yaml", help="Experiment config YAML")
     parser.add_argument("--out", default="runs/negative_fraction_experiment", help="Base output directory; a timestamped child folder is created automatically")
     parser.add_argument("--epochs", type=int, help="Override training epochs")
@@ -278,6 +278,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scales", nargs="+", help="Override input scales, e.g. --scales 56 or --scales 56,112 or --scales 112 224")
     parser.add_argument("--per-class-interval", type=int, help="Override per-class metrics save interval")
     parser.add_argument("--macro-min-support", type=int, help="Ignore classes with lower support for main macro metrics")
+    parser.add_argument("--dynamic-scale", action=argparse.BooleanOptionalAction, help="Enable/disable extra dynamic-scale validation/test pass")
     parser.add_argument("--class-pos-weight", action=argparse.BooleanOptionalAction, help="Enable/disable positive class loss weighting")
     parser.add_argument("--tune-thresholds", action=argparse.BooleanOptionalAction, help="Enable/disable validation threshold tuning")
     return parser.parse_args()
@@ -313,6 +314,8 @@ def apply_overrides(config: Dict[str, Any], args: argparse.Namespace) -> None:
         config.setdefault("logging", {})["per_class_interval"] = args.per_class_interval
     if args.macro_min_support is not None:
         config.setdefault("metrics", {})["macro_min_support"] = args.macro_min_support
+    if args.dynamic_scale is not None:
+        config.setdefault("metrics", {})["evaluate_dynamic_scale"] = args.dynamic_scale
     if args.class_pos_weight is not None:
         config.setdefault("loss", {}).setdefault("class_pos_weight", {})["enabled"] = args.class_pos_weight
     if args.tune_thresholds is not None:

@@ -234,6 +234,7 @@ def run_experiment(config: Dict[str, Any], data_path: str, output_dir: str) -> N
     fractions = [float(value) for value in config.get("experiment", {}).get("negative_fractions", [0.1, 0.2, 0.5, 1.0])]
     comparison_rows = []
     comparison_int8_rows = []
+    timing_summary_rows = []
     for fraction in fractions:
         selected_negatives = sample_negatives(train_candidates, fraction, seed + int(fraction * 10000))
         train_samples = train_positive + selected_negatives
@@ -258,9 +259,14 @@ def run_experiment(config: Dict[str, Any], data_path: str, output_dir: str) -> N
             comparison_rows.append({"run_dir": str(run_dir), **row})
         for row in summary.get("final_int8_rows", []):
             comparison_int8_rows.append({"run_dir": str(run_dir), **row})
+        for row in summary.get("timing_rows", []):
+            timing_summary_rows.append({"run_dir": str(run_dir), **row})
         append_log(output_root, f"Finished fraction {fraction}: best_val_f1_macro={summary['best_val_f1_macro']}")
 
     pd.DataFrame(comparison_rows).to_csv(output_root / "negative_fraction_comparison.csv", index=False)
+    if timing_summary_rows:
+        pd.DataFrame(timing_summary_rows).to_csv(output_root / "eval_timing_summary.csv", index=False)
+        append_log(output_root, "Wrote eval_timing_summary.csv")
     if comparison_int8_rows:
         pd.DataFrame(comparison_int8_rows).to_csv(output_root / "negative_fraction_comparison_int8_dynamic.csv", index=False)
         append_log(output_root, "Wrote negative_fraction_comparison_int8_dynamic.csv")
@@ -285,6 +291,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--per-class-interval", type=int, help="Override per-class metrics save interval")
     parser.add_argument("--macro-min-support", type=int, help="Ignore classes with lower support for main macro metrics")
     parser.add_argument("--dynamic-scale", action=argparse.BooleanOptionalAction, help="Enable/disable extra dynamic-scale validation/test pass")
+    parser.add_argument("--simple-epoch-eval", action=argparse.BooleanOptionalAction, help="When enabled, epoch eval uses validation only at one rotating fixed scale; test runs only in final evaluation")
     parser.add_argument("--int8-dynamic", action=argparse.BooleanOptionalAction, help="Enable/disable final dynamic INT8 checkpoint and test pass")
     parser.add_argument("--class-pos-weight", action=argparse.BooleanOptionalAction, help="Enable/disable positive class loss weighting")
     parser.add_argument("--tune-thresholds", action=argparse.BooleanOptionalAction, help="Enable/disable validation threshold tuning")
@@ -323,6 +330,8 @@ def apply_overrides(config: Dict[str, Any], args: argparse.Namespace) -> None:
         config.setdefault("metrics", {})["macro_min_support"] = args.macro_min_support
     if args.dynamic_scale is not None:
         config.setdefault("metrics", {})["evaluate_dynamic_scale"] = args.dynamic_scale
+    if args.simple_epoch_eval is not None:
+        config.setdefault("metrics", {})["simple_epoch_eval"] = args.simple_epoch_eval
     if args.int8_dynamic is not None:
         config.setdefault("quantization", {}).setdefault("int8_dynamic", {})["enabled"] = args.int8_dynamic
     if args.class_pos_weight is not None:

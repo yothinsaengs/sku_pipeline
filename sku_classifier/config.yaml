@@ -54,6 +54,7 @@ threshold: 0.5
 
 metrics:
   evaluate_dynamic_scale: true
+  simple_epoch_eval: false
   macro_min_support: 5
   tune_thresholds:
     enabled: true

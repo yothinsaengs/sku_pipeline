@@ -1,5 +1,6 @@
 import json
 import math
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -76,6 +77,7 @@ def train_fraction_run(
     eval_scales = list(scales)
     if metrics_cfg.get("evaluate_dynamic_scale", True):
         eval_scales.append("dynamic")
+    simple_epoch_eval = bool(metrics_cfg.get("simple_epoch_eval", False))
     sanity_check_batch(train_ds, config, scales, positive_ids, fraction)
     write_pretrain_summary(
         run_dir=run_dir,
@@ -93,16 +95,24 @@ def train_fraction_run(
     epoch_rows = []
     final_test_rows = []
     final_int8_rows = []
+    timing_rows = []
 
     for epoch in range(1, epochs + 1):
+        train_start = time.perf_counter()
         train_loss = train_one_epoch(model, train_ds, config, criterion, optimizer, device, epoch, epochs, scales)
+        train_seconds = time.perf_counter() - train_start
+        train_sample_count = len(train_ds)
+        batch_size = int(config.get("training", {}).get("batch_size", 32))
+        train_batch_count = math.ceil(train_sample_count / batch_size) if batch_size else 0
         scheduler.step()
 
         val_scale_rows = []
         test_scale_rows = []
         per_class_rows = []
-        for scale in eval_scales:
-            val_loss, val_outputs, val_targets = evaluate_outputs(model, val_ds, criterion, device, scale)
+        epoch_eval_scales = [scales[(epoch - 1) % len(scales)]] if simple_epoch_eval else eval_scales
+        for scale in epoch_eval_scales:
+            val_loss, val_outputs, val_targets, val_seconds = evaluate_outputs(model, val_ds, criterion, device, scale)
+            timing_rows.append(timing_row(fraction, epoch, "epoch_eval", "val", scale, val_ds, val_seconds, device, "fp32"))
             tuned_thresholds = tune_per_class_thresholds(
                 val_outputs,
                 val_targets,
@@ -111,8 +121,14 @@ def train_fraction_run(
                 default_threshold=threshold,
             ) if tune_thresholds_enabled else np.full(len(positive_ids), threshold, dtype=np.float32)
             val_metrics, val_per_class = calculate_metrics(val_outputs, val_targets, tuned_thresholds, macro_min_support=macro_min_support)
-            test_loss, test_outputs, test_targets = evaluate_outputs(model, test_ds, criterion, device, scale)
-            test_metrics, test_per_class = calculate_metrics(test_outputs, test_targets, tuned_thresholds, macro_min_support=macro_min_support)
+            if simple_epoch_eval:
+                test_loss = np.nan
+                test_metrics = empty_test_metrics_like(val_metrics)
+                test_per_class = []
+            else:
+                test_loss, test_outputs, test_targets, test_seconds = evaluate_outputs(model, test_ds, criterion, device, scale)
+                timing_rows.append(timing_row(fraction, epoch, "epoch_eval", "test", scale, test_ds, test_seconds, device, "fp32"))
+                test_metrics, test_per_class = calculate_metrics(test_outputs, test_targets, tuned_thresholds, macro_min_support=macro_min_support)
             val_row = prefixed_row(val_metrics, "val")
             test_row = prefixed_row(test_metrics, "test")
             row = {
@@ -120,6 +136,9 @@ def train_fraction_run(
                 "negative_fraction": fraction,
                 "scale": scale,
                 "train_loss": train_loss,
+                "train_seconds": train_seconds,
+                "train_samples_per_second": train_sample_count / train_seconds if train_seconds > 0 else np.nan,
+                "train_batches_per_second": train_batch_count / train_seconds if train_seconds > 0 else np.nan,
                 "val_loss": val_loss,
                 "test_loss": test_loss,
                 **threshold_row(tuned_thresholds, "threshold"),
@@ -128,14 +147,17 @@ def train_fraction_run(
             }
             epoch_rows.append(row)
             val_scale_rows.append((scale, val_metrics))
-            test_scale_rows.append((scale, test_metrics))
+            if not simple_epoch_eval:
+                test_scale_rows.append((scale, test_metrics))
 
             if epoch % per_class_interval == 0:
                 per_class_rows.extend(format_per_class(epoch, fraction, scale, "val", val_per_class, positive_names))
-                per_class_rows.extend(format_per_class(epoch, fraction, scale, "test", test_per_class, positive_names))
+                if not simple_epoch_eval:
+                    per_class_rows.extend(format_per_class(epoch, fraction, scale, "test", test_per_class, positive_names))
                 per_class_rows.extend(format_thresholds(epoch, fraction, scale, tuned_thresholds, positive_names))
 
         pd.DataFrame(epoch_rows).to_csv(run_dir / "epoch_metrics.csv", index=False)
+        pd.DataFrame(timing_rows).to_csv(run_dir / "eval_timing.csv", index=False)
         if per_class_rows:
             pd.DataFrame(per_class_rows).to_csv(run_dir / f"per_class_metrics_epoch_{epoch:03d}.csv", index=False)
 
@@ -144,7 +166,8 @@ def train_fraction_run(
         append_log(
             run_dir.parent,
             f"fraction={fraction} epoch={epoch} train_loss={train_loss:.6f} "
-            f"mean_val_f1_macro={mean_val_f1:.6f} mean_test_f1_macro={mean_test_f1:.6f}",
+            f"mean_val_f1_macro={mean_val_f1:.6f} mean_test_f1_macro={mean_test_f1:.6f} "
+            f"train_seconds={train_seconds:.3f}",
         )
         if mean_val_f1 > best_val_f1:
             best_val_f1 = mean_val_f1
@@ -157,7 +180,8 @@ def train_fraction_run(
         model.load_state_dict(checkpoint["model_state_dict"])
 
     for scale in eval_scales:
-        val_loss, val_outputs, val_targets = evaluate_outputs(model, val_ds, criterion, device, scale)
+        val_loss, val_outputs, val_targets, val_seconds = evaluate_outputs(model, val_ds, criterion, device, scale)
+        timing_rows.append(timing_row(fraction, 0, "final_fp32", "val", scale, val_ds, val_seconds, device, "fp32"))
         tuned_thresholds = tune_per_class_thresholds(
             val_outputs,
             val_targets,
@@ -165,7 +189,8 @@ def train_fraction_run(
             macro_min_support,
             default_threshold=threshold,
         ) if tune_thresholds_enabled else np.full(len(positive_ids), threshold, dtype=np.float32)
-        loss, test_outputs, test_targets = evaluate_outputs(model, test_ds, criterion, device, scale)
+        loss, test_outputs, test_targets, test_seconds = evaluate_outputs(model, test_ds, criterion, device, scale)
+        timing_rows.append(timing_row(fraction, 0, "final_fp32", "test", scale, test_ds, test_seconds, device, "fp32"))
         metrics, _ = calculate_metrics(test_outputs, test_targets, tuned_thresholds, macro_min_support=macro_min_support)
         final_test_rows.append({"negative_fraction": fraction, "scale": scale, "test_loss": loss, **threshold_row(tuned_thresholds, "threshold"), **metrics})
     pd.DataFrame(final_test_rows).to_csv(run_dir / "final_test_metrics_by_scale.csv", index=False)
@@ -177,7 +202,8 @@ def train_fraction_run(
         append_log(run_dir.parent, f"Saved INT8 dynamic checkpoint: {int8_path}")
         int8_criterion = get_loss_fn(config, pos_weights=pos_weights.cpu())
         for scale in eval_scales:
-            val_loss, val_outputs, val_targets = evaluate_outputs(int8_model, val_ds, int8_criterion, torch.device("cpu"), scale)
+            val_loss, val_outputs, val_targets, val_seconds = evaluate_outputs(int8_model, val_ds, int8_criterion, torch.device("cpu"), scale)
+            timing_rows.append(timing_row(fraction, 0, "final_int8", "val", scale, val_ds, val_seconds, torch.device("cpu"), "int8_dynamic"))
             tuned_thresholds = tune_per_class_thresholds(
                 val_outputs,
                 val_targets,
@@ -185,15 +211,23 @@ def train_fraction_run(
                 macro_min_support,
                 default_threshold=threshold,
             ) if tune_thresholds_enabled else np.full(len(positive_ids), threshold, dtype=np.float32)
-            loss, test_outputs, test_targets = evaluate_outputs(int8_model, test_ds, int8_criterion, torch.device("cpu"), scale)
+            loss, test_outputs, test_targets, test_seconds = evaluate_outputs(int8_model, test_ds, int8_criterion, torch.device("cpu"), scale)
+            timing_rows.append(timing_row(fraction, 0, "final_int8", "test", scale, test_ds, test_seconds, torch.device("cpu"), "int8_dynamic"))
             metrics, _ = calculate_metrics(test_outputs, test_targets, tuned_thresholds, macro_min_support=macro_min_support)
             final_int8_rows.append({"negative_fraction": fraction, "scale": scale, "test_loss": loss, **threshold_row(tuned_thresholds, "threshold"), **metrics})
         pd.DataFrame(final_int8_rows).to_csv(run_dir / "final_test_metrics_by_scale_int8_dynamic.csv", index=False)
         append_log(run_dir.parent, f"Wrote INT8 dynamic final test metrics: {run_dir / 'final_test_metrics_by_scale_int8_dynamic.csv'}")
 
+    pd.DataFrame(timing_rows).to_csv(run_dir / "eval_timing.csv", index=False)
     with (run_dir / "run_summary.json").open("w") as f:
         json.dump({"negative_fraction": fraction, "best_val_f1_macro": best_val_f1}, f, indent=2)
-    return {"negative_fraction": fraction, "best_val_f1_macro": best_val_f1, "final_test_rows": final_test_rows, "final_int8_rows": final_int8_rows}
+    return {
+        "negative_fraction": fraction,
+        "best_val_f1_macro": best_val_f1,
+        "final_test_rows": final_test_rows,
+        "final_int8_rows": final_int8_rows,
+        "timing_rows": timing_rows,
+    }
 
 
 def build_optimizer(model: torch.nn.Module, config: Dict[str, Any]):
@@ -256,6 +290,35 @@ def count_by_role(samples: Sequence[Dict[str, Any]]) -> Dict[str, int]:
 
 def count_images(samples: Sequence[Dict[str, Any]]) -> int:
     return len({sample.get("stem") for sample in samples})
+
+
+def timing_row(
+    fraction: float,
+    epoch: int,
+    phase: str,
+    split: str,
+    scale: int | str,
+    dataset: SKUExperimentDataset,
+    seconds: float,
+    device: torch.device,
+    precision: str,
+) -> Dict[str, Any]:
+    sample_count = len(dataset)
+    image_count = count_images(dataset.samples)
+    return {
+        "negative_fraction": fraction,
+        "epoch": epoch,
+        "phase": phase,
+        "split": split,
+        "scale": scale,
+        "sample_count": sample_count,
+        "image_count": image_count,
+        "seconds": seconds,
+        "samples_per_second": sample_count / seconds if seconds > 0 else np.nan,
+        "images_per_second": image_count / seconds if seconds > 0 else np.nan,
+        "device": str(device),
+        "precision": precision,
+    }
 
 
 def count_boxes_by_class(samples: Sequence[Dict[str, Any]], positive_ids: Sequence[int], positive_names: Sequence[str]) -> str:
@@ -390,9 +453,11 @@ def train_one_epoch(model, dataset: SKUExperimentDataset, config: Dict[str, Any]
 
 
 def evaluate_outputs(model, dataset: SKUExperimentDataset, criterion, device, scale: int | str):
+    start = time.perf_counter()
     dataset.set_fixed_size(scale)
     if scale == "dynamic":
-        return evaluate_outputs_dynamic(model, dataset, criterion, device)
+        loss, outputs, targets = evaluate_outputs_dynamic(model, dataset, criterion, device)
+        return loss, outputs, targets, time.perf_counter() - start
     loader = make_loader(dataset, dataset.config, training=False)
     model.eval()
     losses = []
@@ -409,7 +474,7 @@ def evaluate_outputs(model, dataset: SKUExperimentDataset, criterion, device, sc
             targets_all.append(hard_targets.numpy())
     outputs_np = np.concatenate(outputs_all, axis=0) if outputs_all else np.array([])
     targets_np = np.concatenate(targets_all, axis=0) if targets_all else np.array([])
-    return float(np.mean(losses)) if losses else 0.0, outputs_np, targets_np
+    return float(np.mean(losses)) if losses else 0.0, outputs_np, targets_np, time.perf_counter() - start
 
 
 def evaluate_outputs_dynamic(model, dataset: SKUExperimentDataset, criterion, device):
@@ -470,6 +535,10 @@ def threshold_row(thresholds: np.ndarray, prefix: str) -> Dict[str, float]:
 
 def prefixed_row(metrics: Dict[str, Any], prefix: str) -> Dict[str, Any]:
     return {f"{prefix}_{key}": value for key, value in metrics.items()}
+
+
+def empty_test_metrics_like(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: np.nan for key in metrics}
 
 
 def format_per_class(

@@ -34,6 +34,8 @@ model:
 training:
   epochs: 50
   batch_size: 32
+  prefetch_batches: 3
+  eval_prefetch_batches: 3
   optimizer: adamw
   lr: 0.0003
   weight_decay: 0.01
@@ -58,6 +60,7 @@ metrics:
   macro_min_support: 5
   tune_thresholds:
     enabled: true
+    strategy: global
     candidates: [0.10, 0.30, 0.50, 0.70, 0.90]
 
 quantization:

@@ -1,6 +1,8 @@
 import json
 import math
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -113,7 +115,7 @@ def train_fraction_run(
         for scale in epoch_eval_scales:
             val_loss, val_outputs, val_targets, val_seconds = evaluate_outputs(model, val_ds, criterion, device, scale)
             timing_rows.append(timing_row(fraction, epoch, "epoch_eval", "val", scale, val_ds, val_seconds, device, "fp32"))
-            tuned_thresholds = tune_per_class_thresholds(
+            tuned_thresholds = tune_global_threshold(
                 val_outputs,
                 val_targets,
                 threshold_candidates,
@@ -182,7 +184,7 @@ def train_fraction_run(
     for scale in eval_scales:
         val_loss, val_outputs, val_targets, val_seconds = evaluate_outputs(model, val_ds, criterion, device, scale)
         timing_rows.append(timing_row(fraction, 0, "final_fp32", "val", scale, val_ds, val_seconds, device, "fp32"))
-        tuned_thresholds = tune_per_class_thresholds(
+        tuned_thresholds = tune_global_threshold(
             val_outputs,
             val_targets,
             threshold_candidates,
@@ -204,7 +206,7 @@ def train_fraction_run(
         for scale in eval_scales:
             val_loss, val_outputs, val_targets, val_seconds = evaluate_outputs(int8_model, val_ds, int8_criterion, torch.device("cpu"), scale)
             timing_rows.append(timing_row(fraction, 0, "final_int8", "val", scale, val_ds, val_seconds, torch.device("cpu"), "int8_dynamic"))
-            tuned_thresholds = tune_per_class_thresholds(
+            tuned_thresholds = tune_global_threshold(
                 val_outputs,
                 val_targets,
                 threshold_candidates,
@@ -436,9 +438,10 @@ def train_one_epoch(model, dataset: SKUExperimentDataset, config: Dict[str, Any]
     sampler = BatchRatioSampler(dataset.samples, batch_size, config.get("sampling", {}).get("pos_neg_ratio", "1:1"))
     indices = list(iter(sampler))
     batches = [indices[start:start + batch_size] for start in range(0, len(indices), batch_size)]
-    for batch_indices in tqdm(batches, desc=f"Epoch {epoch}/{epochs}", leave=False):
-        dataset.set_fixed_size(int(np.random.choice(scales)))
-        batch = [dataset[index] for index in batch_indices]
+    prefetch_batches = int(config.get("training", {}).get("prefetch_batches", 0) or 0)
+    batch_plans = [(batch_indices, int(np.random.choice(scales))) for batch_indices in batches]
+    batch_iter = iter_prefetched_batches(dataset, batch_plans, prefetch_batches)
+    for batch in tqdm(batch_iter, total=len(batch_plans), desc=f"Epoch {epoch}/{epochs}", leave=False):
         inputs = torch.stack([item[0] for item in batch], dim=0)
         targets = torch.stack([item[1] for item in batch], dim=0)
         inputs = inputs.to(device)
@@ -452,52 +455,69 @@ def train_one_epoch(model, dataset: SKUExperimentDataset, config: Dict[str, Any]
     return float(np.mean(losses)) if losses else 0.0
 
 
+def load_batch_at_size(dataset: SKUExperimentDataset, batch_indices: Sequence[int], size: int):
+    return [dataset.get_item_at_size(index, size) for index in batch_indices]
+
+
+def iter_prefetched_batches(dataset: SKUExperimentDataset, batch_plans: Sequence[tuple[Sequence[int], int]], prefetch_batches: int):
+    if prefetch_batches <= 0 or len(batch_plans) <= 1:
+        for batch_indices, size in batch_plans:
+            yield load_batch_at_size(dataset, batch_indices, size)
+        return
+
+    max_workers = min(prefetch_batches, len(batch_plans))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        pending = deque()
+        plan_iter = iter(batch_plans)
+        for _ in range(min(prefetch_batches, len(batch_plans))):
+            batch_indices, size = next(plan_iter)
+            pending.append(executor.submit(load_batch_at_size, dataset, batch_indices, size))
+
+        for batch_indices, size in plan_iter:
+            future = pending.popleft()
+            pending.append(executor.submit(load_batch_at_size, dataset, batch_indices, size))
+            yield future.result()
+
+        while pending:
+            yield pending.popleft().result()
+
+
 def evaluate_outputs(model, dataset: SKUExperimentDataset, criterion, device, scale: int | str):
     start = time.perf_counter()
-    dataset.set_fixed_size(scale)
-    if scale == "dynamic":
-        loss, outputs, targets = evaluate_outputs_dynamic(model, dataset, criterion, device)
-        return loss, outputs, targets, time.perf_counter() - start
-    loader = make_loader(dataset, dataset.config, training=False)
     model.eval()
     losses = []
     outputs_all = []
     targets_all = []
+    batch_size = int(dataset.config.get("training", {}).get("batch_size", 32))
+    prefetch_batches = int(dataset.config.get("training", {}).get("eval_prefetch_batches", dataset.config.get("training", {}).get("prefetch_batches", 0)) or 0)
+    indices = list(range(len(dataset)))
+    batches = [indices[start_idx:start_idx + batch_size] for start_idx in range(0, len(indices), batch_size)]
+    batch_plans = [(batch_indices, scale) for batch_indices in batches]
     with torch.no_grad():
-        for inputs, targets, hard_targets in loader:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            losses.append(float(loss.item()))
-            outputs_all.append(outputs.cpu().numpy())
-            targets_all.append(hard_targets.numpy())
+        for batch in iter_prefetched_batches(dataset, batch_plans, prefetch_batches):
+            for grouped in group_batch_by_shape(batch):
+                inputs = torch.stack([item[0] for item in grouped], dim=0).to(device)
+                targets = torch.stack([item[1] for item in grouped], dim=0).to(device)
+                hard_targets = torch.stack([item[2] for item in grouped], dim=0)
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                losses.append(float(loss.item()))
+                outputs_all.append(outputs.cpu().numpy())
+                targets_all.append(hard_targets.numpy())
     outputs_np = np.concatenate(outputs_all, axis=0) if outputs_all else np.array([])
     targets_np = np.concatenate(targets_all, axis=0) if targets_all else np.array([])
     return float(np.mean(losses)) if losses else 0.0, outputs_np, targets_np, time.perf_counter() - start
 
 
-def evaluate_outputs_dynamic(model, dataset: SKUExperimentDataset, criterion, device):
-    model.eval()
-    losses = []
-    outputs_all = []
-    targets_all = []
-    with torch.no_grad():
-        for index in range(len(dataset)):
-            inputs, targets, hard_targets = dataset[index]
-            inputs = inputs.unsqueeze(0).to(device)
-            targets = targets.unsqueeze(0).to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            losses.append(float(loss.item()))
-            outputs_all.append(outputs.cpu().numpy())
-            targets_all.append(hard_targets.unsqueeze(0).numpy())
-    outputs_np = np.concatenate(outputs_all, axis=0) if outputs_all else np.array([])
-    targets_np = np.concatenate(targets_all, axis=0) if targets_all else np.array([])
-    return float(np.mean(losses)) if losses else 0.0, outputs_np, targets_np
+def group_batch_by_shape(batch):
+    groups = {}
+    for item in batch:
+        shape = tuple(item[0].shape)
+        groups.setdefault(shape, []).append(item)
+    return groups.values()
 
 
-def tune_per_class_thresholds(
+def tune_global_threshold(
     outputs: np.ndarray,
     hard_targets: np.ndarray,
     candidates: Sequence[float],
@@ -506,31 +526,22 @@ def tune_per_class_thresholds(
 ) -> np.ndarray:
     if outputs.size == 0 or hard_targets.size == 0:
         return np.full(0, default_threshold, dtype=np.float32)
-    thresholds = np.full(outputs.shape[1], default_threshold, dtype=np.float32)
-    for class_index in range(outputs.shape[1]):
-        y_true = hard_targets[:, class_index]
-        support = int(y_true.sum())
-        if support < min_support or np.unique(y_true).size < 2:
-            continue
-        best_threshold = default_threshold
-        best_f1 = -1.0
-        for candidate in candidates:
-            y_pred = (outputs[:, class_index] >= candidate).astype(np.int32)
-            tp = int(((y_pred == 1) & (y_true == 1)).sum())
-            fp = int(((y_pred == 1) & (y_true == 0)).sum())
-            fn = int(((y_pred == 0) & (y_true == 1)).sum())
-            precision = tp / (tp + fp) if tp + fp else 0.0
-            recall = tp / (tp + fn) if tp + fn else 0.0
-            f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-            if f1 > best_f1:
-                best_f1 = f1
-                best_threshold = candidate
-        thresholds[class_index] = best_threshold
-    return thresholds
+    best_threshold = default_threshold
+    best_f1 = -1.0
+    for candidate in candidates:
+        metrics, _ = calculate_metrics(outputs, hard_targets, candidate, macro_min_support=min_support)
+        f1 = float(metrics["f1_macro"])
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = candidate
+    return np.full(outputs.shape[1], best_threshold, dtype=np.float32)
 
 
 def threshold_row(thresholds: np.ndarray, prefix: str) -> Dict[str, float]:
-    return {f"{prefix}_class_{index}": float(value) for index, value in enumerate(thresholds)}
+    row = {f"{prefix}_class_{index}": float(value) for index, value in enumerate(thresholds)}
+    if len(thresholds):
+        row[f"{prefix}_global"] = float(thresholds[0])
+    return row
 
 
 def prefixed_row(metrics: Dict[str, Any], prefix: str) -> Dict[str, Any]:

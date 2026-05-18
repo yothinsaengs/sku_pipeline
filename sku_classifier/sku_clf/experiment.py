@@ -281,6 +281,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", default="runs/negative_fraction_experiment", help="Base output directory; a timestamped child folder is created automatically")
     parser.add_argument("--epochs", type=int, help="Override training epochs")
     parser.add_argument("--batch-size", type=int, help="Override batch size")
+    parser.add_argument("--prefetch-batches", type=int, help="Prepare next N train batches in background threads")
+    parser.add_argument("--eval-prefetch-batches", type=int, help="Prepare next N val/test batches in background threads")
     parser.add_argument("--device", help="Override device, e.g. auto, cpu, cuda, mps")
     parser.add_argument("--num-workers", type=int, help="Override DataLoader workers")
     parser.add_argument("--backbone", help="Override timm backbone")
@@ -310,6 +312,10 @@ def apply_overrides(config: Dict[str, Any], args: argparse.Namespace) -> None:
         config.setdefault("training", {})["epochs"] = args.epochs
     if args.batch_size is not None:
         config.setdefault("training", {})["batch_size"] = args.batch_size
+    if args.prefetch_batches is not None:
+        config.setdefault("training", {})["prefetch_batches"] = args.prefetch_batches
+    if args.eval_prefetch_batches is not None:
+        config.setdefault("training", {})["eval_prefetch_batches"] = args.eval_prefetch_batches
     if args.device is not None:
         config.setdefault("training", {})["device"] = args.device
     if args.num_workers is not None:

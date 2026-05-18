@@ -36,11 +36,11 @@ def probabilities_to_labels(outputs: np.ndarray, threshold: float | np.ndarray |
     negative_label = outputs.shape[1]
     thresholds = normalize_thresholds(threshold, negative_label)
     for row in outputs:
-        active = np.where(row >= thresholds)[0]
-        if active.size == 0:
-            labels.append(negative_label)
+        pred_class = int(np.argmax(row))
+        if row[pred_class] >= thresholds[pred_class]:
+            labels.append(pred_class)
         else:
-            labels.append(int(active[np.argmax(row[active])]))
+            labels.append(negative_label)
     return np.array(labels, dtype=np.int64)
 
 

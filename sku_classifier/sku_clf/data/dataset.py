@@ -189,28 +189,32 @@ class SKUExperimentDataset(Dataset):
         self.fixed_size = size
 
     def __getitem__(self, idx: int):
+        return self.get_item_at_size(idx, self.fixed_size)
+
+    def get_item_at_size(self, idx: int, size_override: Optional[int | str] = None):
         sample = self.samples[idx]
         image = cv2.imread(sample["image_path"])
         if image is None:
             raise FileNotFoundError(sample["image_path"])
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         crop = self._crop(image, sample["bbox"])
-        size = self._resolve_size(crop)
+        size = self._resolve_size(crop, size_override)
         crop = self._letterbox(crop, size)
         tensor = torch.from_numpy(crop).permute(2, 0, 1).float() / 255.0
         target, hard_target = self._targets(sample)
         return tensor, torch.from_numpy(target), torch.from_numpy(hard_target)
 
-    def _resolve_size(self, crop: np.ndarray) -> int:
-        if self.fixed_size == "dynamic":
+    def _resolve_size(self, crop: np.ndarray, size_override: Optional[int | str] = None) -> int:
+        selected_size = self.fixed_size if size_override is None else size_override
+        if selected_size == "dynamic":
             max_side = max(crop.shape[:2])
             if max_side <= 56:
                 return 56
             if max_side <= 112:
                 return 112
             return 224
-        if self.fixed_size:
-            return int(self.fixed_size)
+        if selected_size:
+            return int(selected_size)
         return random.choice(self.sizes) if self.is_training else max(self.sizes)
 
     def _targets(self, sample: Dict[str, Any]):

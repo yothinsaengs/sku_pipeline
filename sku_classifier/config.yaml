@@ -20,6 +20,11 @@ input:
   context_margin: 0.0
   pad_color: 114
 
+cache:
+  crops:
+    enabled: false
+    format: pt
+
 sampling:
   pos_neg_ratio: "1:1"
 

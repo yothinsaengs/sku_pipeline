@@ -193,6 +193,10 @@ class SKUExperimentDataset(Dataset):
 
     def get_item_at_size(self, idx: int, size_override: Optional[int | str] = None):
         sample = self.samples[idx]
+        cached = self._load_cached(sample, size_override)
+        if cached is not None:
+            target, hard_target = self._targets(sample)
+            return cached, torch.from_numpy(target), torch.from_numpy(hard_target)
         image = cv2.imread(sample["image_path"])
         if image is None:
             raise FileNotFoundError(sample["image_path"])
@@ -203,6 +207,20 @@ class SKUExperimentDataset(Dataset):
         tensor = torch.from_numpy(crop).permute(2, 0, 1).float() / 255.0
         target, hard_target = self._targets(sample)
         return tensor, torch.from_numpy(target), torch.from_numpy(hard_target)
+
+    def _load_cached(self, sample: Dict[str, Any], size_override: Optional[int | str]):
+        cache_paths = sample.get("cache_paths")
+        if not cache_paths:
+            return None
+        selected_size = self.fixed_size if size_override is None else size_override
+        if selected_size == "dynamic":
+            return None
+        if not selected_size:
+            return None
+        path = cache_paths.get(str(int(selected_size)))
+        if not path or not Path(path).exists():
+            return None
+        return torch.load(path, map_location="cpu")
 
     def _resolve_size(self, crop: np.ndarray, size_override: Optional[int | str] = None) -> int:
         selected_size = self.fixed_size if size_override is None else size_override

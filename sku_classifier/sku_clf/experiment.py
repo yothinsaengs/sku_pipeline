@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
 import pandas as pd
+import torch
 import yaml
 
-from sku_clf.data.dataset import build_samples, discover_records, resolve_negative_ids, split_records
+from sku_clf.data.dataset import SKUExperimentDataset, build_samples, discover_records, resolve_negative_ids, split_records
 from sku_clf.logging_utils import append_log
 from sku_clf.merge import merge_human_and_roi_dataset
 from sku_clf.train import train_fraction_run
@@ -144,6 +145,52 @@ def write_positive_cap_summary(
     pd.DataFrame(rows).to_csv(path, index=False)
 
 
+def maybe_cache_samples(
+    output_root: Path,
+    config: Dict[str, Any],
+    split_name: str,
+    samples: Sequence[Dict[str, Any]],
+    positive_ids: Sequence[int],
+) -> List[Dict[str, Any]]:
+    cache_cfg = config.get("cache", {}).get("crops", {})
+    if not cache_cfg.get("enabled", False):
+        return list(samples)
+    cache_format = cache_cfg.get("format", "pt")
+    if cache_format != "pt":
+        raise ValueError(f"Unsupported crop cache format: {cache_format}")
+    scales = [int(size) for size in config.get("input", {}).get("sizes", [56, 112, 224])]
+    cache_root = output_root / "crop_cache" / split_name
+    cache_root.mkdir(parents=True, exist_ok=True)
+    uncached_ds = SKUExperimentDataset(samples, positive_ids, config, is_training=False)
+    cached_samples = []
+    rows = []
+    for index, sample in enumerate(samples):
+        sample_copy = dict(sample)
+        cache_paths = {}
+        for scale in scales:
+            scale_dir = cache_root / str(scale)
+            scale_dir.mkdir(parents=True, exist_ok=True)
+            path = scale_dir / f"{index:08d}.pt"
+            tensor, _, _ = uncached_ds.get_item_at_size(index, scale)
+            torch.save(tensor, path)
+            cache_paths[str(scale)] = str(path)
+            rows.append({
+                "split": split_name,
+                "index": index,
+                "scale": scale,
+                "cache_path": str(path),
+                "stem": sample.get("stem", ""),
+                "role": sample.get("role", ""),
+                "source": sample.get("source", ""),
+                "class_id": sample.get("class_id", -1),
+            })
+        sample_copy["cache_paths"] = cache_paths
+        cached_samples.append(sample_copy)
+    pd.DataFrame(rows).to_csv(cache_root / "cache_manifest.csv", index=False)
+    append_log(output_root, f"Cached {len(samples)} {split_name} samples at scales={scales} under {cache_root}")
+    return cached_samples
+
+
 def validate_raw_input_dataset(data_path: str, extract_to: Path) -> str:
     data_dir = extract_dataset(data_path, extract_to=str(extract_to))
     images_dir, labels_dir = resolve_data_paths(data_dir)
@@ -230,6 +277,8 @@ def run_experiment(config: Dict[str, Any], data_path: str, output_dir: str) -> N
     test_samples = split_samples["test"]["positives"] + split_samples["test"]["negative_boxes"] + split_samples["test"]["background"]
     validate_samples(val_samples, "val")
     validate_samples(test_samples, "test")
+    cached_val_samples = maybe_cache_samples(output_root, config, "val", val_samples, positive_ids)
+    cached_test_samples = maybe_cache_samples(output_root, config, "test", test_samples, positive_ids)
 
     fractions = [float(value) for value in config.get("experiment", {}).get("negative_fractions", [0.1, 0.2, 0.5, 1.0])]
     comparison_rows = []
@@ -244,15 +293,16 @@ def run_experiment(config: Dict[str, Any], data_path: str, output_dir: str) -> N
         run_dir.mkdir(parents=True, exist_ok=True)
         append_log(output_root, f"Starting fraction {fraction}: selected_train_negatives={len(selected_negatives)}")
         write_manifest(run_dir / "negative_pool_manifest.csv", selected_negatives, "train")
-        write_manifest(run_dir / "train_manifest.csv", train_samples, "train")
+        cached_train_samples = maybe_cache_samples(output_root, config, f"negative_fraction_{int(round(fraction * 100)):03d}_train", train_samples, positive_ids)
+        write_manifest(run_dir / "train_manifest.csv", cached_train_samples, "train")
         summary = train_fraction_run(
             config=config,
             run_dir=run_dir,
             positive_ids=positive_ids,
             positive_names=positive_names,
-            train_samples=train_samples,
-            val_samples=val_samples,
-            test_samples=test_samples,
+            train_samples=cached_train_samples,
+            val_samples=cached_val_samples,
+            test_samples=cached_test_samples,
             fraction=fraction,
         )
         for row in summary["final_test_rows"]:
@@ -283,6 +333,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, help="Override batch size")
     parser.add_argument("--prefetch-batches", type=int, help="Prepare next N train batches in background threads")
     parser.add_argument("--eval-prefetch-batches", type=int, help="Prepare next N val/test batches in background threads")
+    parser.add_argument("--cache-crops", action=argparse.BooleanOptionalAction, help="Enable/disable cached crop tensors under the run folder")
     parser.add_argument("--device", help="Override device, e.g. auto, cpu, cuda, mps")
     parser.add_argument("--num-workers", type=int, help="Override DataLoader workers")
     parser.add_argument("--backbone", help="Override timm backbone")
@@ -316,6 +367,8 @@ def apply_overrides(config: Dict[str, Any], args: argparse.Namespace) -> None:
         config.setdefault("training", {})["prefetch_batches"] = args.prefetch_batches
     if args.eval_prefetch_batches is not None:
         config.setdefault("training", {})["eval_prefetch_batches"] = args.eval_prefetch_batches
+    if args.cache_crops is not None:
+        config.setdefault("cache", {}).setdefault("crops", {})["enabled"] = args.cache_crops
     if args.device is not None:
         config.setdefault("training", {})["device"] = args.device
     if args.num_workers is not None:

@@ -196,6 +196,9 @@ def train_fraction_run(
         metrics, _ = calculate_metrics(test_outputs, test_targets, tuned_thresholds, macro_min_support=macro_min_support)
         final_test_rows.append({"negative_fraction": fraction, "scale": scale, "test_loss": loss, **threshold_row(tuned_thresholds, "threshold"), **metrics})
     pd.DataFrame(final_test_rows).to_csv(run_dir / "final_test_metrics_by_scale.csv", index=False)
+    fp32_inference_config = build_inference_config(config, fraction, best_val_f1, positive_ids, positive_names, final_test_rows, precision="fp32")
+    write_inference_config(run_dir / "inference_config.json", fp32_inference_config)
+    write_inference_config(run_dir / "checkpoints" / "best_model.inference_config.json", fp32_inference_config)
 
     if config.get("quantization", {}).get("int8_dynamic", {}).get("enabled", True):
         int8_model = quantize_model_int8(model)
@@ -218,11 +221,21 @@ def train_fraction_run(
             metrics, _ = calculate_metrics(test_outputs, test_targets, tuned_thresholds, macro_min_support=macro_min_support)
             final_int8_rows.append({"negative_fraction": fraction, "scale": scale, "test_loss": loss, **threshold_row(tuned_thresholds, "threshold"), **metrics})
         pd.DataFrame(final_int8_rows).to_csv(run_dir / "final_test_metrics_by_scale_int8_dynamic.csv", index=False)
+        int8_inference_config = build_inference_config(config, fraction, best_val_f1, positive_ids, positive_names, final_int8_rows, precision="int8_dynamic")
+        write_inference_config(run_dir / "inference_config_int8_dynamic.json", int8_inference_config)
+        write_inference_config(run_dir / "checkpoints" / "best_model_int8_dynamic.inference_config.json", int8_inference_config)
         append_log(run_dir.parent, f"Wrote INT8 dynamic final test metrics: {run_dir / 'final_test_metrics_by_scale_int8_dynamic.csv'}")
 
     pd.DataFrame(timing_rows).to_csv(run_dir / "eval_timing.csv", index=False)
     with (run_dir / "run_summary.json").open("w") as f:
-        json.dump({"negative_fraction": fraction, "best_val_f1_macro": best_val_f1}, f, indent=2)
+        json.dump({
+            "negative_fraction": fraction,
+            "best_val_f1_macro": best_val_f1,
+            "best_confidence": fp32_inference_config["inference"]["best_confidence"],
+            "best_scale": fp32_inference_config["inference"]["scale"],
+            "class_index": fp32_inference_config["class_index"],
+            "inference_config": "inference_config.json",
+        }, f, indent=2)
     return {
         "negative_fraction": fraction,
         "best_val_f1_macro": best_val_f1,
@@ -230,6 +243,55 @@ def train_fraction_run(
         "final_int8_rows": final_int8_rows,
         "timing_rows": timing_rows,
     }
+
+
+def build_inference_config(
+    config: Dict[str, Any],
+    fraction: float,
+    best_val_f1: float,
+    positive_ids: Sequence[int],
+    positive_names: Sequence[str],
+    final_rows: Sequence[Dict[str, Any]],
+    precision: str,
+) -> Dict[str, Any]:
+    best_row = select_best_inference_row(final_rows)
+    thresholds = {
+        str(index): float(best_row.get(f"threshold_class_{index}", best_row.get("threshold_global", config.get("threshold", 0.5))))
+        for index in range(len(positive_ids))
+    }
+    best_confidence = float(best_row.get("threshold_global", config.get("threshold", 0.5)))
+    return {
+        "negative_fraction": fraction,
+        "best_val_f1_macro": best_val_f1,
+        "precision": precision,
+        "model": config.get("model", {}),
+        "input": config.get("input", {}),
+        "class_index": [
+            {"index": index, "class_id": int(class_id), "class_name": positive_names[index]}
+            for index, class_id in enumerate(positive_ids)
+        ],
+        "negative_class": {
+            "index": len(positive_ids),
+            "class_ids": [int(value) for value in config.get("experiment", {}).get("negative_class_ids", [])],
+            "class_name": config.get("experiment", {}).get("negative_class_name", "GENERAL_SKU_SINGLE"),
+        },
+        "inference": {
+            "scale": best_row.get("scale", "dynamic"),
+            "best_confidence": best_confidence,
+            "thresholds": thresholds,
+        },
+    }
+
+
+def select_best_inference_row(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    if not rows:
+        return {}
+    return max(rows, key=lambda row: float(row.get("f1_macro", row.get("accuracy", -1.0))))
+
+
+def write_inference_config(path: Path, inference_config: Dict[str, Any]) -> None:
+    with path.open("w") as f:
+        json.dump(inference_config, f, indent=2)
 
 
 def build_optimizer(model: torch.nn.Module, config: Dict[str, Any]):

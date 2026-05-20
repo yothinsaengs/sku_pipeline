@@ -19,6 +19,7 @@ setup(
     entry_points={
         "console_scripts": [
             "sku-clf=sku_clf.cli:main",
+            "sku-clf-infer=sku_clf.infer:main",
         ],
     },
 )
